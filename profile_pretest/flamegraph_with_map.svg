@@ -1,0 +1,2128 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="614" onload="init(evt)" viewBox="0 0 1200 614" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom();
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				clearzoom();
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		// Fit in full text width
+		if (/^ *$/.test(txt) || t.getSubStringLength(0, txt.length) < w)
+			return;
+
+		for (var x = txt.length - 2; x > 0; x--) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom() {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="614.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >Flame Graph</text>
+<text id="details" x="10.00" y="597" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="597" > </text>
+<g id="frames">
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="830.6" y="117" width="0.9" height="15.0" fill="rgb(213,208,21)" rx="2" ry="2" />
+<text  x="833.61" y="127.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::execute (1,311 samples, 95.07%)</title><rect x="64.8" y="277" width="1121.8" height="15.0" fill="rgb(254,19,7)" rx="2" ry="2" />
+<text  x="67.76" y="287.5" >WasmEdge::Executor::Executor::execute</text>
+</g>
+<g >
+<title>__gnu_cxx::operator!=&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="1105.3" y="181" width="0.8" height="15.0" fill="rgb(250,100,47)" rx="2" ry="2" />
+<text  x="1108.29" y="191.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="718.5" y="213" width="0.9" height="15.0" fill="rgb(225,127,52)" rx="2" ry="2" />
+<text  x="721.51" y="223.5" ></text>
+</g>
+<g >
+<title>__normal_iterator (26 samples, 1.89%)</title><rect x="1056.5" y="181" width="22.3" height="15.0" fill="rgb(222,160,8)" rx="2" ry="2" />
+<text  x="1059.51" y="191.5" >_..</text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="845.2" y="149" width="0.8" height="15.0" fill="rgb(240,72,18)" rx="2" ry="2" />
+<text  x="848.16" y="159.5" ></text>
+</g>
+<g >
+<title>async_page_fault (5 samples, 0.36%)</title><rect x="52.8" y="517" width="4.3" height="15.0" fill="rgb(249,162,44)" rx="2" ry="2" />
+<text  x="55.78" y="527.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::Instance::ModuleInstance*, std::allocator&lt;WasmEdge::Runtime::Instance::ModuleInstance*&gt; &gt;::size (5 samples, 0.36%)</title><rect x="702.3" y="197" width="4.2" height="15.0" fill="rgb(236,88,49)" rx="2" ry="2" />
+<text  x="705.26" y="207.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::ValType, std::allocator&lt;WasmEdge::ValType&gt; &gt;::size (4 samples, 0.29%)</title><rect x="808.4" y="213" width="3.4" height="15.0" fill="rgb(215,211,44)" rx="2" ry="2" />
+<text  x="811.36" y="223.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::Instance::MemoryInstance::checkAccessBound (4 samples, 0.29%)</title><rect x="1124.1" y="213" width="3.4" height="15.0" fill="rgb(223,183,3)" rx="2" ry="2" />
+<text  x="1127.11" y="223.5" ></text>
+</g>
+<g >
+<title>__normal_iterator (1 samples, 0.07%)</title><rect x="1136.1" y="197" width="0.8" height="15.0" fill="rgb(214,216,18)" rx="2" ry="2" />
+<text  x="1139.09" y="207.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="845.2" y="133" width="0.8" height="15.0" fill="rgb(247,184,47)" rx="2" ry="2" />
+<text  x="848.16" y="143.5" ></text>
+</g>
+<g >
+<title>__do_munmap (1 samples, 0.07%)</title><rect x="59.6" y="453" width="0.9" height="15.0" fill="rgb(246,64,7)" rx="2" ry="2" />
+<text  x="62.63" y="463.5" ></text>
+</g>
+<g >
+<title>_Hashtable&lt;const std::pair&lt;const WasmEdge::OpCode, std::basic_string&lt;char&gt; &gt; *&gt; (1 samples, 0.07%)</title><rect x="1187.4" y="469" width="0.9" height="15.0" fill="rgb(245,31,43)" rx="2" ry="2" />
+<text  x="1190.43" y="479.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (11 samples, 0.80%)</title><rect x="686.9" y="133" width="9.4" height="15.0" fill="rgb(215,95,16)" rx="2" ry="2" />
+<text  x="689.85" y="143.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::operator!=&lt;WasmEdge::Runtime::StackManager::Label*, std::vector&lt;WasmEdge::Runtime::StackManager::Label, std::allocator&lt;WasmEdge::Runtime::StackManager::Label&gt; &gt; &gt; (1 samples, 0.07%)</title><rect x="1136.9" y="181" width="0.9" height="15.0" fill="rgb(211,205,45)" rx="2" ry="2" />
+<text  x="1139.95" y="191.5" ></text>
+</g>
+<g >
+<title>expected&lt;const unsigned int &amp;, nullptr, true&gt; (2 samples, 0.15%)</title><rect x="813.5" y="197" width="1.7" height="15.0" fill="rgb(212,155,4)" rx="2" ry="2" />
+<text  x="816.50" y="207.5" ></text>
+</g>
+<g >
+<title>_GLOBAL__sub_I_errinfo.cpp (1 samples, 0.07%)</title><rect x="50.2" y="501" width="0.9" height="15.0" fill="rgb(217,41,46)" rx="2" ry="2" />
+<text  x="53.22" y="511.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::pushLabel (5 samples, 0.36%)</title><rect x="709.1" y="229" width="4.3" height="15.0" fill="rgb(207,91,30)" rx="2" ry="2" />
+<text  x="712.10" y="239.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (24 samples, 1.74%)</title><rect x="781.8" y="197" width="20.6" height="15.0" fill="rgb(253,192,20)" rx="2" ry="2" />
+<text  x="784.83" y="207.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::Instance::MemoryInstance::checkAccessBound (4 samples, 0.29%)</title><rect x="894.8" y="213" width="3.4" height="15.0" fill="rgb(251,108,44)" rx="2" ry="2" />
+<text  x="897.79" y="223.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (52 samples, 3.77%)</title><rect x="988.1" y="213" width="44.5" height="15.0" fill="rgb(237,2,31)" rx="2" ry="2" />
+<text  x="991.06" y="223.5" >std:..</text>
+</g>
+<g >
+<title>_Hashtable&lt;const std::pair&lt;const WasmEdge::ErrCode, std::basic_string&lt;char&gt; &gt; *&gt; (1 samples, 0.07%)</title><rect x="51.9" y="437" width="0.9" height="15.0" fill="rgb(205,102,40)" rx="2" ry="2" />
+<text  x="54.93" y="447.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (5 samples, 0.36%)</title><rect x="1044.5" y="213" width="4.3" height="15.0" fill="rgb(217,224,54)" rx="2" ry="2" />
+<text  x="1047.53" y="223.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::getBottomN (1 samples, 0.07%)</title><rect x="1083.9" y="229" width="0.8" height="15.0" fill="rgb(226,0,1)" rx="2" ry="2" />
+<text  x="1086.89" y="239.5" ></text>
+</g>
+<g >
+<title>zap_pte_range.isra.0 (1 samples, 0.07%)</title><rect x="59.6" y="373" width="0.9" height="15.0" fill="rgb(207,200,9)" rx="2" ry="2" />
+<text  x="62.63" y="383.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="701.4" y="133" width="0.9" height="15.0" fill="rgb(247,131,53)" rx="2" ry="2" />
+<text  x="704.40" y="143.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="845.2" y="101" width="0.8" height="15.0" fill="rgb(242,54,34)" rx="2" ry="2" />
+<text  x="848.16" y="111.5" ></text>
+</g>
+<g >
+<title>VariadicUnion&lt;const unsigned __int128 &amp;&gt; (24 samples, 1.74%)</title><rect x="591.9" y="101" width="20.5" height="15.0" fill="rgb(248,181,27)" rx="2" ry="2" />
+<text  x="594.87" y="111.5" ></text>
+</g>
+<g >
+<title>__normal_iterator (3 samples, 0.22%)</title><rect x="1081.3" y="181" width="2.6" height="15.0" fill="rgb(208,160,28)" rx="2" ry="2" />
+<text  x="1084.33" y="191.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Loader::Loader::loadSectionContent&lt;WasmEdge::AST::CodeSection, WasmEdge::Loader::Loader::loadSection (3 samples, 0.22%)</title><rect x="61.3" y="293" width="2.6" height="15.0" fill="rgb(209,179,30)" rx="2" ry="2" />
+<text  x="64.34" y="303.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (2 samples, 0.15%)</title><rect x="871.7" y="117" width="1.7" height="15.0" fill="rgb(210,152,15)" rx="2" ry="2" />
+<text  x="874.68" y="127.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::new_allocator&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (4 samples, 0.29%)</title><rect x="798.9" y="149" width="3.5" height="15.0" fill="rgb(215,76,47)" rx="2" ry="2" />
+<text  x="801.95" y="159.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runAddOp&lt;unsigned int&gt; (2 samples, 0.15%)</title><rect x="706.5" y="245" width="1.7" height="15.0" fill="rgb(249,217,4)" rx="2" ry="2" />
+<text  x="709.53" y="255.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runReturnOp (23 samples, 1.67%)</title><rect x="1086.5" y="245" width="19.6" height="15.0" fill="rgb(235,23,34)" rx="2" ry="2" />
+<text  x="1089.46" y="255.5" ></text>
+</g>
+<g >
+<title>expected_storage_base&lt;const unsigned int &amp;, nullptr, true&gt; (1 samples, 0.07%)</title><rect x="649.2" y="85" width="0.9" height="15.0" fill="rgb(248,80,29)" rx="2" ry="2" />
+<text  x="652.20" y="95.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (7 samples, 0.51%)</title><rect x="864.8" y="101" width="6.0" height="15.0" fill="rgb(238,8,0)" rx="2" ry="2" />
+<text  x="867.84" y="111.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (50 samples, 3.63%)</title><rect x="1142.9" y="229" width="42.8" height="15.0" fill="rgb(237,146,30)" rx="2" ry="2" />
+<text  x="1145.94" y="239.5" >std:..</text>
+</g>
+<g >
+<title>__gnu_cxx::new_allocator&lt;WasmEdge::Runtime::StackManager::Label&gt;::construct&lt;WasmEdge::Runtime::StackManager::Label, unsigned long, unsigned int const&amp;, WasmEdge::AST::Instruction const*&amp;, std::optional&lt;WasmEdge::AST::Instruction const*&gt;&amp;&gt; (1 samples, 0.07%)</title><rect x="711.7" y="181" width="0.8" height="15.0" fill="rgb(231,64,23)" rx="2" ry="2" />
+<text  x="714.67" y="191.5" ></text>
+</g>
+<g >
+<title>_Alloc_hider (1 samples, 0.07%)</title><rect x="51.1" y="437" width="0.8" height="15.0" fill="rgb(227,199,48)" rx="2" ry="2" />
+<text  x="54.07" y="447.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runBrOp (8 samples, 0.58%)</title><rect x="719.4" y="245" width="6.8" height="15.0" fill="rgb(227,179,37)" rx="2" ry="2" />
+<text  x="722.37" y="255.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (2 samples, 0.15%)</title><rect x="871.7" y="101" width="1.7" height="15.0" fill="rgb(249,105,51)" rx="2" ry="2" />
+<text  x="874.68" y="111.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getInstance&lt;WasmEdge::Runtime::Instance::MemoryInstance&gt; (20 samples, 1.45%)</title><rect x="683.4" y="213" width="17.1" height="15.0" fill="rgb(207,134,13)" rx="2" ry="2" />
+<text  x="686.43" y="223.5" ></text>
+</g>
+<g >
+<title>pair&lt;WasmEdge::ErrCode, char const  (1 samples, 0.07%)</title><rect x="51.1" y="469" width="0.8" height="15.0" fill="rgb(221,18,29)" rx="2" ry="2" />
+<text  x="54.07" y="479.5" ></text>
+</g>
+<g >
+<title>prepend_path.isra.0 (1 samples, 0.07%)</title><rect x="58.8" y="389" width="0.8" height="15.0" fill="rgb(249,102,22)" rx="2" ry="2" />
+<text  x="61.77" y="399.5" ></text>
+</g>
+<g >
+<title>expected_storage_base&lt;WasmEdge::Runtime::Instance::GlobalInstance *const &amp;, nullptr, true&gt; (7 samples, 0.51%)</title><rect x="864.8" y="53" width="6.0" height="15.0" fill="rgb(227,45,3)" rx="2" ry="2" />
+<text  x="867.84" y="63.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::isTopDummyFrame (25 samples, 1.81%)</title><rect x="662.0" y="229" width="21.4" height="15.0" fill="rgb(228,210,39)" rx="2" ry="2" />
+<text  x="665.04" y="239.5" >W..</text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::size (3 samples, 0.22%)</title><rect x="1137.8" y="229" width="2.6" height="15.0" fill="rgb(232,117,9)" rx="2" ry="2" />
+<text  x="1140.80" y="239.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (21 samples, 1.52%)</title><rect x="1167.8" y="213" width="17.9" height="15.0" fill="rgb(219,204,20)" rx="2" ry="2" />
+<text  x="1170.75" y="223.5" ></text>
+</g>
+<g >
+<title>__normal_iterator (1 samples, 0.07%)</title><rect x="718.5" y="181" width="0.9" height="15.0" fill="rgb(231,138,42)" rx="2" ry="2" />
+<text  x="721.51" y="191.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runLocalGetOp (157 samples, 11.39%)</title><rect x="898.2" y="245" width="134.4" height="15.0" fill="rgb(207,93,0)" rx="2" ry="2" />
+<text  x="901.21" y="255.5" >WasmEdge::Execut..</text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::end (6 samples, 0.44%)</title><rect x="816.9" y="197" width="5.2" height="15.0" fill="rgb(250,179,33)" rx="2" ry="2" />
+<text  x="819.92" y="207.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runSubOp&lt;unsigned int&gt; (1 samples, 0.07%)</title><rect x="1135.2" y="245" width="0.9" height="15.0" fill="rgb(250,31,44)" rx="2" ry="2" />
+<text  x="1138.24" y="255.5" ></text>
+</g>
+<g >
+<title>std::_Hashtable&lt;WasmEdge::OpCode, std::pair&lt;WasmEdge::OpCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;WasmEdge::OpCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt;, std::__detail::_Select1st, std::equal_to&lt;WasmEdge::OpCode&gt;, std::hash&lt;WasmEdge::OpCode&gt;, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits&lt;false, false, true&gt; &gt;::_M_insert&lt;std::pair&lt;WasmEdge::OpCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; const&amp;, std::__detail::_AllocNode&lt;std::allocator&lt;std::__detail::_Hash_node&lt;std::pair&lt;WasmEdge::OpCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, false&gt; &gt; &gt; &gt; (1 samples, 0.07%)</title><rect x="1187.4" y="437" width="0.9" height="15.0" fill="rgb(248,117,28)" rx="2" ry="2" />
+<text  x="1190.43" y="447.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;std::allocator&lt;WasmEdge::Runtime::StackManager::Label&gt; &gt;::construct&lt;WasmEdge::Runtime::StackManager::Label, unsigned long, unsigned int const&amp;, WasmEdge::AST::Instruction const*&amp;, std::optional&lt;WasmEdge::AST::Instruction const*&gt;&amp;&gt; (1 samples, 0.07%)</title><rect x="711.7" y="197" width="0.8" height="15.0" fill="rgb(224,143,20)" rx="2" ry="2" />
+<text  x="714.67" y="207.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (11 samples, 0.80%)</title><rect x="686.9" y="165" width="9.4" height="15.0" fill="rgb(214,113,9)" rx="2" ry="2" />
+<text  x="689.85" y="175.5" ></text>
+</g>
+<g >
+<title>_Variant_storage (1 samples, 0.07%)</title><rect x="63.9" y="149" width="0.9" height="15.0" fill="rgb(238,157,37)" rx="2" ry="2" />
+<text  x="66.91" y="159.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::pop (52 samples, 3.77%)</title><rect x="1141.2" y="245" width="44.5" height="15.0" fill="rgb(236,17,15)" rx="2" ry="2" />
+<text  x="1144.23" y="255.5" >Wasm..</text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::back (23 samples, 1.67%)</title><rect x="663.7" y="213" width="19.7" height="15.0" fill="rgb(241,123,10)" rx="2" ry="2" />
+<text  x="666.75" y="223.5" ></text>
+</g>
+<g >
+<title>std::__detail::_Mod_range_hashing::operator (1 samples, 0.07%)</title><rect x="1187.4" y="357" width="0.9" height="15.0" fill="rgb(246,149,24)" rx="2" ry="2" />
+<text  x="1190.43" y="367.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::instantiateModule (1 samples, 0.07%)</title><rect x="63.9" y="325" width="0.9" height="15.0" fill="rgb(221,94,20)" rx="2" ry="2" />
+<text  x="66.91" y="335.5" ></text>
+</g>
+<g >
+<title>_Hashtable&lt;const std::pair&lt;const WasmEdge::ErrInfo::MismatchCategory, std::basic_string&lt;char&gt; &gt; *&gt; (1 samples, 0.07%)</title><rect x="50.2" y="437" width="0.9" height="15.0" fill="rgb(240,114,9)" rx="2" ry="2" />
+<text  x="53.22" y="447.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getModule (1 samples, 0.07%)</title><rect x="830.6" y="213" width="0.9" height="15.0" fill="rgb(241,114,34)" rx="2" ry="2" />
+<text  x="833.61" y="223.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::new_allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt;::construct&lt;WasmEdge::Runtime::StackManager::Frame, unsigned int const&amp;, unsigned long, unsigned long, unsigned int const&amp;&gt; (1 samples, 0.07%)</title><rect x="804.9" y="165" width="0.9" height="15.0" fill="rgb(222,122,27)" rx="2" ry="2" />
+<text  x="807.94" y="175.5" ></text>
+</g>
+<g >
+<title>std::__invoke_impl&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1,316 samples, 95.43%)</title><rect x="61.3" y="373" width="1126.1" height="15.0" fill="rgb(239,119,39)" rx="2" ry="2" />
+<text  x="64.34" y="383.5" >std::__invoke_impl&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128..</text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (16 samples, 1.16%)</title><rect x="974.4" y="213" width="13.7" height="15.0" fill="rgb(246,126,38)" rx="2" ry="2" />
+<text  x="977.37" y="223.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (2 samples, 0.15%)</title><rect x="813.5" y="181" width="1.7" height="15.0" fill="rgb(234,220,40)" rx="2" ry="2" />
+<text  x="816.50" y="191.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Validator::Validator::validate (1 samples, 0.07%)</title><rect x="1186.6" y="293" width="0.8" height="15.0" fill="rgb(247,78,29)" rx="2" ry="2" />
+<text  x="1189.58" y="303.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Label, std::allocator&lt;WasmEdge::Runtime::StackManager::Label&gt; &gt;::operator[] (6 samples, 0.44%)</title><rect x="1094.2" y="213" width="5.1" height="15.0" fill="rgb(222,171,36)" rx="2" ry="2" />
+<text  x="1097.16" y="223.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getFunction (2 samples, 0.15%)</title><rect x="822.1" y="229" width="1.7" height="15.0" fill="rgb(228,113,18)" rx="2" ry="2" />
+<text  x="825.05" y="239.5" ></text>
+</g>
+<g >
+<title>do_exit (2 samples, 0.15%)</title><rect x="1188.3" y="469" width="1.7" height="15.0" fill="rgb(220,219,46)" rx="2" ry="2" />
+<text  x="1191.29" y="479.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::end (12 samples, 0.87%)</title><rect x="854.6" y="181" width="10.2" height="15.0" fill="rgb(218,89,46)" rx="2" ry="2" />
+<text  x="857.57" y="191.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="805.8" y="197" width="0.8" height="15.0" fill="rgb(236,21,15)" rx="2" ry="2" />
+<text  x="808.79" y="207.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::Instance::GlobalInstance::getValue (4 samples, 0.29%)</title><rect x="831.5" y="229" width="3.4" height="15.0" fill="rgb(230,166,27)" rx="2" ry="2" />
+<text  x="834.46" y="239.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (2 samples, 0.15%)</title><rect x="813.5" y="149" width="1.7" height="15.0" fill="rgb(241,24,36)" rx="2" ry="2" />
+<text  x="816.50" y="159.5" ></text>
+</g>
+<g >
+<title>VariadicUnion&lt;1, const unsigned __int128 &amp;&gt; (24 samples, 1.74%)</title><rect x="591.9" y="117" width="20.5" height="15.0" fill="rgb(222,90,41)" rx="2" ry="2" />
+<text  x="594.87" y="127.5" ></text>
+</g>
+<g >
+<title>expected&lt;const unsigned int &amp;, nullptr, true&gt; (1 samples, 0.07%)</title><rect x="649.2" y="197" width="0.9" height="15.0" fill="rgb(243,91,31)" rx="2" ry="2" />
+<text  x="652.20" y="207.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getModule (3 samples, 0.22%)</title><rect x="871.7" y="213" width="2.5" height="15.0" fill="rgb(219,191,25)" rx="2" ry="2" />
+<text  x="874.68" y="223.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::Instance::MemoryInstance::loadValue&lt;unsigned int&gt; (14 samples, 1.02%)</title><rect x="886.2" y="229" width="12.0" height="15.0" fill="rgb(226,130,51)" rx="2" ry="2" />
+<text  x="889.23" y="239.5" ></text>
+</g>
+<g >
+<title>Statistics (1 samples, 0.07%)</title><rect x="60.5" y="485" width="0.8" height="15.0" fill="rgb(243,156,41)" rx="2" ry="2" />
+<text  x="63.49" y="495.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 samples, 0.07%)</title><rect x="50.2" y="373" width="0.9" height="15.0" fill="rgb(236,95,51)" rx="2" ry="2" />
+<text  x="53.22" y="383.5" ></text>
+</g>
+<g >
+<title>release_pages (1 samples, 0.07%)</title><rect x="1188.3" y="373" width="0.8" height="15.0" fill="rgb(245,202,38)" rx="2" ry="2" />
+<text  x="1191.29" y="383.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="1136.1" y="229" width="0.8" height="15.0" fill="rgb(239,50,37)" rx="2" ry="2" />
+<text  x="1139.09" y="239.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (2 samples, 0.15%)</title><rect x="1099.3" y="213" width="1.7" height="15.0" fill="rgb(237,10,21)" rx="2" ry="2" />
+<text  x="1102.30" y="223.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::end (26 samples, 1.89%)</title><rect x="1056.5" y="197" width="22.3" height="15.0" fill="rgb(212,26,6)" rx="2" ry="2" />
+<text  x="1059.51" y="207.5" >s..</text>
+</g>
+<g >
+<title>WasmEdge::Validator::Validator::validate (1 samples, 0.07%)</title><rect x="1186.6" y="325" width="0.8" height="15.0" fill="rgb(221,141,26)" rx="2" ry="2" />
+<text  x="1189.58" y="335.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::enterFunction (98 samples, 7.11%)</title><rect x="727.9" y="229" width="83.9" height="15.0" fill="rgb(239,24,37)" rx="2" ry="2" />
+<text  x="730.93" y="239.5" >WasmEdge:..</text>
+</g>
+<g >
+<title>__x64_sys_brk (1 samples, 0.07%)</title><rect x="57.1" y="485" width="0.8" height="15.0" fill="rgb(213,206,26)" rx="2" ry="2" />
+<text  x="60.06" y="495.5" ></text>
+</g>
+<g >
+<title>std::thread::_Invoker&lt;std::tuple&lt;WasmEdge::VM::Async&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1,316 samples, 95.43%)</title><rect x="61.3" y="485" width="1126.1" height="15.0" fill="rgb(211,181,38)" rx="2" ry="2" />
+<text  x="64.34" y="495.5" >std::thread::_Invoker&lt;std::tuple&lt;WasmEdge::VM::Async&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, d..</text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="845.2" y="165" width="0.8" height="15.0" fill="rgb(210,143,26)" rx="2" ry="2" />
+<text  x="848.16" y="175.5" ></text>
+</g>
+<g >
+<title>std::__detail::_Insert_base&lt;WasmEdge::ErrCode, std::pair&lt;WasmEdge::ErrCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;WasmEdge::ErrCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt;, std::__detail::_Select1st, std::equal_to&lt;WasmEdge::ErrCode&gt;, std::hash&lt;WasmEdge::ErrCode&gt;, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits&lt;false, false, true&gt; &gt;::insert (1 samples, 0.07%)</title><rect x="51.9" y="421" width="0.9" height="15.0" fill="rgb(209,30,30)" rx="2" ry="2" />
+<text  x="54.93" y="431.5" ></text>
+</g>
+<g >
+<title>VariadicUnion&lt;6, const unsigned __int128 &amp;&gt; (24 samples, 1.74%)</title><rect x="591.9" y="197" width="20.5" height="15.0" fill="rgb(215,144,13)" rx="2" ry="2" />
+<text  x="594.87" y="207.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::Instance::GlobalInstance*, std::allocator&lt;WasmEdge::Runtime::Instance::GlobalInstance*&gt; &gt;::size (1 samples, 0.07%)</title><rect x="870.8" y="181" width="0.9" height="15.0" fill="rgb(226,22,21)" rx="2" ry="2" />
+<text  x="873.83" y="191.5" ></text>
+</g>
+<g >
+<title>tlb_finish_mmu (1 samples, 0.07%)</title><rect x="1188.3" y="421" width="0.8" height="15.0" fill="rgb(234,10,54)" rx="2" ry="2" />
+<text  x="1191.29" y="431.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="701.4" y="149" width="0.9" height="15.0" fill="rgb(225,59,48)" rx="2" ry="2" />
+<text  x="704.40" y="159.5" ></text>
+</g>
+<g >
+<title>VM (1 samples, 0.07%)</title><rect x="60.5" y="501" width="0.8" height="15.0" fill="rgb(237,96,29)" rx="2" ry="2" />
+<text  x="63.49" y="511.5" ></text>
+</g>
+<g >
+<title>__handle_mm_fault (1 samples, 0.07%)</title><rect x="50.2" y="309" width="0.9" height="15.0" fill="rgb(209,177,11)" rx="2" ry="2" />
+<text  x="53.22" y="319.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (11 samples, 0.80%)</title><rect x="686.9" y="117" width="9.4" height="15.0" fill="rgb(215,12,17)" rx="2" ry="2" />
+<text  x="689.85" y="127.5" ></text>
+</g>
+<g >
+<title>__normal_iterator (23 samples, 1.67%)</title><rect x="663.7" y="181" width="19.7" height="15.0" fill="rgb(251,89,16)" rx="2" ry="2" />
+<text  x="666.75" y="191.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::Instance::ModuleInstance::getGlobalAddr (8 samples, 0.58%)</title><rect x="845.2" y="213" width="6.8" height="15.0" fill="rgb(238,77,0)" rx="2" ry="2" />
+<text  x="848.16" y="223.5" ></text>
+</g>
+<g >
+<title>do_mprotect_pkey (2 samples, 0.15%)</title><rect x="57.9" y="469" width="1.7" height="15.0" fill="rgb(230,64,49)" rx="2" ry="2" />
+<text  x="60.92" y="479.5" ></text>
+</g>
+<g >
+<title>all (1,379 samples, 100%)</title><rect x="10.0" y="565" width="1180.0" height="15.0" fill="rgb(237,200,30)" rx="2" ry="2" />
+<text  x="13.00" y="575.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (2 samples, 0.15%)</title><rect x="813.5" y="117" width="1.7" height="15.0" fill="rgb(250,97,54)" rx="2" ry="2" />
+<text  x="816.50" y="127.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::getMemInstByIdx (73 samples, 5.29%)</title><rect x="644.1" y="245" width="62.4" height="15.0" fill="rgb(212,99,7)" rx="2" ry="2" />
+<text  x="647.07" y="255.5" >WasmEd..</text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getInstance&lt;WasmEdge::Runtime::Instance::ModuleInstance&gt; (3 samples, 0.22%)</title><rect x="871.7" y="197" width="2.5" height="15.0" fill="rgb(216,158,40)" rx="2" ry="2" />
+<text  x="874.68" y="207.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Loader::Loader::loadSegment (3 samples, 0.22%)</title><rect x="61.3" y="229" width="2.6" height="15.0" fill="rgb(246,173,50)" rx="2" ry="2" />
+<text  x="64.34" y="239.5" ></text>
+</g>
+<g >
+<title>std::__uninitialized_fill_n&lt;true&gt;::__uninit_fill_n&lt;unsigned long*, unsigned long, unsigned long&gt; (1 samples, 0.07%)</title><rect x="60.5" y="405" width="0.8" height="15.0" fill="rgb(207,63,14)" rx="2" ry="2" />
+<text  x="63.49" y="415.5" ></text>
+</g>
+<g >
+<title>vector (1 samples, 0.07%)</title><rect x="60.5" y="469" width="0.8" height="15.0" fill="rgb(252,120,35)" rx="2" ry="2" />
+<text  x="63.49" y="479.5" ></text>
+</g>
+<g >
+<title>__cxx_global_var_init.126 (1 samples, 0.07%)</title><rect x="1187.4" y="517" width="0.9" height="15.0" fill="rgb(240,32,3)" rx="2" ry="2" />
+<text  x="1190.43" y="527.5" ></text>
+</g>
+<g >
+<title>_Hashtable (1 samples, 0.07%)</title><rect x="50.2" y="421" width="0.9" height="15.0" fill="rgb(236,145,33)" rx="2" ry="2" />
+<text  x="53.22" y="431.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="1083.9" y="213" width="0.8" height="15.0" fill="rgb(242,163,54)" rx="2" ry="2" />
+<text  x="1086.89" y="223.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::pushFunction&lt;unsigned int&amp;, WasmEdge::AST::FunctionType const&amp;, cxx20::span&lt;std::pair&lt;unsigned int, WasmEdge::ValType&gt; const, 18446744073709551615ul&gt;, cxx20::span&lt;WasmEdge::AST::Instruction const, 18446744073709551615ul&gt; &gt; (1 samples, 0.07%)</title><rect x="63.9" y="277" width="0.9" height="15.0" fill="rgb(237,159,10)" rx="2" ry="2" />
+<text  x="66.91" y="287.5" ></text>
+</g>
+<g >
+<title>WasmEdge::AST::Instruction::getNum (24 samples, 1.74%)</title><rect x="591.9" y="245" width="20.5" height="15.0" fill="rgb(230,151,43)" rx="2" ry="2" />
+<text  x="594.87" y="255.5" ></text>
+</g>
+<g >
+<title>mem_cgroup_try_charge_delay (1 samples, 0.07%)</title><rect x="54.5" y="389" width="0.9" height="15.0" fill="rgb(253,114,24)" rx="2" ry="2" />
+<text  x="57.50" y="399.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::pop (1 samples, 0.07%)</title><rect x="718.5" y="229" width="0.9" height="15.0" fill="rgb(218,123,48)" rx="2" ry="2" />
+<text  x="721.51" y="239.5" ></text>
+</g>
+<g >
+<title>change_protection_range (1 samples, 0.07%)</title><rect x="57.9" y="421" width="0.9" height="15.0" fill="rgb(252,217,43)" rx="2" ry="2" />
+<text  x="60.92" y="431.5" ></text>
+</g>
+<g >
+<title>do_fault (1 samples, 0.07%)</title><rect x="56.2" y="405" width="0.9" height="15.0" fill="rgb(245,127,0)" rx="2" ry="2" />
+<text  x="59.21" y="415.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (4 samples, 0.29%)</title><rect x="57.1" y="501" width="3.4" height="15.0" fill="rgb(231,222,14)" rx="2" ry="2" />
+<text  x="60.06" y="511.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Loader::Loader::parseModule (3 samples, 0.22%)</title><rect x="61.3" y="341" width="2.6" height="15.0" fill="rgb(214,50,6)" rx="2" ry="2" />
+<text  x="64.34" y="351.5" ></text>
+</g>
+<g >
+<title>perf_iterate_ctx (1 samples, 0.07%)</title><rect x="57.1" y="421" width="0.8" height="15.0" fill="rgb(247,162,19)" rx="2" ry="2" />
+<text  x="60.06" y="431.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::getOffset (35 samples, 2.54%)</title><rect x="1048.8" y="229" width="30.0" height="15.0" fill="rgb(250,63,29)" rx="2" ry="2" />
+<text  x="1051.81" y="239.5" >Wa..</text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runCallOp (118 samples, 8.56%)</title><rect x="726.2" y="245" width="101.0" height="15.0" fill="rgb(238,6,45)" rx="2" ry="2" />
+<text  x="729.21" y="255.5" >WasmEdge::Ex..</text>
+</g>
+<g >
+<title>cxx20::expected&lt;void, WasmEdge::ErrCode&gt;::operator bool (1 samples, 0.07%)</title><rect x="1133.5" y="229" width="0.9" height="15.0" fill="rgb(207,51,22)" rx="2" ry="2" />
+<text  x="1136.52" y="239.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runGlobalSetOp (38 samples, 2.76%)</title><rect x="841.7" y="245" width="32.5" height="15.0" fill="rgb(227,89,3)" rx="2" ry="2" />
+<text  x="844.73" y="255.5" >Wa..</text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::AST::Instruction, std::allocator&lt;WasmEdge::AST::Instruction&gt; &gt;::reserve (1 samples, 0.07%)</title><rect x="63.9" y="37" width="0.9" height="15.0" fill="rgb(235,185,34)" rx="2" ry="2" />
+<text  x="66.91" y="47.5" ></text>
+</g>
+<g >
+<title>std::__atomic_base&lt;unsigned int&gt;::exchange (2 samples, 0.15%)</title><rect x="724.5" y="213" width="1.7" height="15.0" fill="rgb(229,101,16)" rx="2" ry="2" />
+<text  x="727.50" y="223.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::AST::Instruction, std::allocator&lt;WasmEdge::AST::Instruction&gt; &gt;::emplace_back&lt;WasmEdge::OpCode&amp;, unsigned long&amp;&gt; (1 samples, 0.07%)</title><rect x="63.1" y="181" width="0.8" height="15.0" fill="rgb(236,70,5)" rx="2" ry="2" />
+<text  x="66.05" y="191.5" ></text>
+</g>
+<g >
+<title>std::thread::_Invoker&lt;std::tuple&lt;WasmEdge::VM::Async&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1,316 samples, 95.43%)</title><rect x="61.3" y="501" width="1126.1" height="15.0" fill="rgb(254,150,5)" rx="2" ry="2" />
+<text  x="64.34" y="511.5" >std::thread::_Invoker&lt;std::tuple&lt;WasmEdge::VM::Async&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, d..</text>
+</g>
+<g >
+<title>expected_storage_base (7 samples, 0.51%)</title><rect x="864.8" y="117" width="6.0" height="15.0" fill="rgb(229,147,0)" rx="2" ry="2" />
+<text  x="867.84" y="127.5" ></text>
+</g>
+<g >
+<title>__perf_event_header__init_id.isra.0 (1 samples, 0.07%)</title><rect x="57.1" y="389" width="0.8" height="15.0" fill="rgb(230,18,46)" rx="2" ry="2" />
+<text  x="60.06" y="399.5" ></text>
+</g>
+<g >
+<title>unmap_page_range (1 samples, 0.07%)</title><rect x="59.6" y="389" width="0.9" height="15.0" fill="rgb(252,79,0)" rx="2" ry="2" />
+<text  x="62.63" y="399.5" ></text>
+</g>
+<g >
+<title>operator (1,316 samples, 95.43%)</title><rect x="61.3" y="437" width="1126.1" height="15.0" fill="rgb(245,33,9)" rx="2" ry="2" />
+<text  x="64.34" y="447.5" >operator</text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runShrOp&lt;unsigned int&gt; (1 samples, 0.07%)</title><rect x="1106.1" y="245" width="0.9" height="15.0" fill="rgb(251,165,19)" rx="2" ry="2" />
+<text  x="1109.14" y="255.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (7 samples, 0.51%)</title><rect x="864.8" y="85" width="6.0" height="15.0" fill="rgb(213,12,14)" rx="2" ry="2" />
+<text  x="867.84" y="95.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Loader::Loader::loadInstruction (2 samples, 0.15%)</title><rect x="61.3" y="181" width="1.8" height="15.0" fill="rgb(251,96,44)" rx="2" ry="2" />
+<text  x="64.34" y="191.5" ></text>
+</g>
+<g >
+<title>do_user_addr_fault (1 samples, 0.07%)</title><rect x="60.5" y="293" width="0.8" height="15.0" fill="rgb(240,167,7)" rx="2" ry="2" />
+<text  x="63.49" y="303.5" ></text>
+</g>
+<g >
+<title>expected&lt;WasmEdge::Runtime::Instance::ModuleInstance *const &amp;, nullptr, true&gt; (1 samples, 0.07%)</title><rect x="830.6" y="165" width="0.9" height="15.0" fill="rgb(246,62,44)" rx="2" ry="2" />
+<text  x="833.61" y="175.5" ></text>
+</g>
+<g >
+<title>operator (1,130 samples, 81.94%)</title><rect x="219.6" y="261" width="967.0" height="15.0" fill="rgb(232,31,49)" rx="2" ry="2" />
+<text  x="222.64" y="271.5" >operator</text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::back (12 samples, 0.87%)</title><rect x="854.6" y="197" width="10.2" height="15.0" fill="rgb(247,93,9)" rx="2" ry="2" />
+<text  x="857.57" y="207.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (6 samples, 0.44%)</title><rect x="1078.8" y="213" width="5.1" height="15.0" fill="rgb(223,106,14)" rx="2" ry="2" />
+<text  x="1081.76" y="223.5" ></text>
+</g>
+<g >
+<title>_Variadic_union&lt;cxx20::span&lt;const std::pair&lt;unsigned int, WasmEdge::ValType&gt;, 18446744073709551615&gt; &amp;, cxx20::span&lt;const WasmEdge::AST::Instruction, 18446744073709551615&gt; &amp;&gt; (1 samples, 0.07%)</title><rect x="63.9" y="85" width="0.9" height="15.0" fill="rgb(210,160,39)" rx="2" ry="2" />
+<text  x="66.91" y="95.5" ></text>
+</g>
+<g >
+<title>Instruction (1 samples, 0.07%)</title><rect x="63.1" y="133" width="0.8" height="15.0" fill="rgb(254,55,44)" rx="2" ry="2" />
+<text  x="66.05" y="143.5" ></text>
+</g>
+<g >
+<title>WasmEdge::AST::Limit::getMin (3 samples, 0.22%)</title><rect x="895.6" y="197" width="2.6" height="15.0" fill="rgb(220,160,37)" rx="2" ry="2" />
+<text  x="898.64" y="207.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Loader::Loader::loadModule (3 samples, 0.22%)</title><rect x="61.3" y="325" width="2.6" height="15.0" fill="rgb(209,16,16)" rx="2" ry="2" />
+<text  x="64.34" y="335.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::popFrame (8 samples, 0.58%)</title><rect x="1099.3" y="229" width="6.8" height="15.0" fill="rgb(239,92,45)" rx="2" ry="2" />
+<text  x="1102.30" y="239.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::Instance::ModuleInstance*, std::allocator&lt;WasmEdge::Runtime::Instance::ModuleInstance*&gt; &gt;::size (1 samples, 0.07%)</title><rect x="873.4" y="181" width="0.8" height="15.0" fill="rgb(205,170,38)" rx="2" ry="2" />
+<text  x="876.39" y="191.5" ></text>
+</g>
+<g >
+<title>__x64_sys_munmap (1 samples, 0.07%)</title><rect x="59.6" y="485" width="0.9" height="15.0" fill="rgb(240,47,4)" rx="2" ry="2" />
+<text  x="62.63" y="495.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::emplace_back&lt;unsigned int const&amp;, unsigned long, unsigned long, unsigned int const&amp;&gt; (3 samples, 0.22%)</title><rect x="803.2" y="197" width="2.6" height="15.0" fill="rgb(242,171,15)" rx="2" ry="2" />
+<text  x="806.23" y="207.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;unsigned int, std::allocator&lt;unsigned int&gt; &gt;::size (1 samples, 0.07%)</title><rect x="815.2" y="213" width="0.9" height="15.0" fill="rgb(248,215,27)" rx="2" ry="2" />
+<text  x="818.21" y="223.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::back (4 samples, 0.29%)</title><rect x="1101.0" y="213" width="3.4" height="15.0" fill="rgb(213,165,43)" rx="2" ry="2" />
+<text  x="1104.01" y="223.5" ></text>
+</g>
+<g >
+<title>__normal_iterator (6 samples, 0.44%)</title><rect x="816.9" y="181" width="5.2" height="15.0" fill="rgb(218,73,9)" rx="2" ry="2" />
+<text  x="819.92" y="191.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::push&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (52 samples, 3.77%)</title><rect x="988.1" y="229" width="44.5" height="15.0" fill="rgb(206,85,34)" rx="2" ry="2" />
+<text  x="991.06" y="239.5" >Wasm..</text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getInstance&lt;WasmEdge::Runtime::Instance::GlobalInstance&gt; (8 samples, 0.58%)</title><rect x="864.8" y="197" width="6.9" height="15.0" fill="rgb(223,65,14)" rx="2" ry="2" />
+<text  x="867.84" y="207.5" ></text>
+</g>
+<g >
+<title>Frame (1 samples, 0.07%)</title><rect x="804.9" y="149" width="0.9" height="15.0" fill="rgb(226,123,17)" rx="2" ry="2" />
+<text  x="807.94" y="159.5" ></text>
+</g>
+<g >
+<title>cxx20::expected&lt;void, WasmEdge::ErrCode&gt;::operator bool (13 samples, 0.94%)</title><rect x="208.5" y="261" width="11.1" height="15.0" fill="rgb(247,157,42)" rx="2" ry="2" />
+<text  x="211.52" y="271.5" ></text>
+</g>
+<g >
+<title>expected&lt;WasmEdge::Runtime::Instance::GlobalInstance *const &amp;, nullptr, true&gt; (7 samples, 0.51%)</title><rect x="864.8" y="181" width="6.0" height="15.0" fill="rgb(251,179,50)" rx="2" ry="2" />
+<text  x="867.84" y="191.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Label, std::allocator&lt;WasmEdge::Runtime::StackManager::Label&gt; &gt;::emplace_back&lt;unsigned long, unsigned int const&amp;, WasmEdge::AST::Instruction const*&amp;, std::optional&lt;WasmEdge::AST::Instruction const*&gt;&amp;&gt; (3 samples, 0.22%)</title><rect x="710.0" y="213" width="2.5" height="15.0" fill="rgb(229,46,36)" rx="2" ry="2" />
+<text  x="712.96" y="223.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (2 samples, 0.15%)</title><rect x="806.6" y="197" width="1.8" height="15.0" fill="rgb(251,134,48)" rx="2" ry="2" />
+<text  x="809.65" y="207.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="701.4" y="165" width="0.9" height="15.0" fill="rgb(239,31,27)" rx="2" ry="2" />
+<text  x="704.40" y="175.5" ></text>
+</g>
+<g >
+<title>_Uninitialized&lt;cxx20::span&lt;const std::pair&lt;unsigned int, WasmEdge::ValType&gt;, 18446744073709551615&gt; &amp;, cxx20::span&lt;const WasmEdge::AST::Instruction, 18446744073709551615&gt; &amp;&gt; (1 samples, 0.07%)</title><rect x="63.9" y="69" width="0.9" height="15.0" fill="rgb(250,103,41)" rx="2" ry="2" />
+<text  x="66.91" y="79.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getInstance&lt;WasmEdge::Runtime::Instance::ModuleInstance&gt; (4 samples, 0.29%)</title><rect x="823.8" y="213" width="3.4" height="15.0" fill="rgb(230,170,34)" rx="2" ry="2" />
+<text  x="826.76" y="223.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (2 samples, 0.15%)</title><rect x="871.7" y="69" width="1.7" height="15.0" fill="rgb(228,161,29)" rx="2" ry="2" />
+<text  x="874.68" y="79.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::getBottomN (16 samples, 1.16%)</title><rect x="974.4" y="229" width="13.7" height="15.0" fill="rgb(208,142,54)" rx="2" ry="2" />
+<text  x="977.37" y="239.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="649.2" y="181" width="0.9" height="15.0" fill="rgb(206,112,48)" rx="2" ry="2" />
+<text  x="652.20" y="191.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (3 samples, 0.22%)</title><rect x="1081.3" y="197" width="2.6" height="15.0" fill="rgb(205,143,19)" rx="2" ry="2" />
+<text  x="1084.33" y="207.5" ></text>
+</g>
+<g >
+<title>do_user_addr_fault (5 samples, 0.36%)</title><rect x="52.8" y="453" width="4.3" height="15.0" fill="rgb(223,193,24)" rx="2" ry="2" />
+<text  x="55.78" y="463.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::getBottomLabel (10 samples, 0.73%)</title><rect x="1090.7" y="229" width="8.6" height="15.0" fill="rgb(251,183,6)" rx="2" ry="2" />
+<text  x="1093.74" y="239.5" ></text>
+</g>
+<g >
+<title>__normal_iterator (12 samples, 0.87%)</title><rect x="854.6" y="165" width="10.2" height="15.0" fill="rgb(224,195,48)" rx="2" ry="2" />
+<text  x="857.57" y="175.5" ></text>
+</g>
+<g >
+<title>expected&lt;const unsigned int &amp;, nullptr, true&gt; (1 samples, 0.07%)</title><rect x="649.2" y="213" width="0.9" height="15.0" fill="rgb(230,135,51)" rx="2" ry="2" />
+<text  x="652.20" y="223.5" ></text>
+</g>
+<g >
+<title>do_page_fault (5 samples, 0.36%)</title><rect x="52.8" y="485" width="4.3" height="15.0" fill="rgb(235,21,13)" rx="2" ry="2" />
+<text  x="55.78" y="495.5" ></text>
+</g>
+<g >
+<title>expected&lt;const unsigned int &amp;, nullptr, true&gt; (1 samples, 0.07%)</title><rect x="845.2" y="181" width="0.8" height="15.0" fill="rgb(219,125,44)" rx="2" ry="2" />
+<text  x="848.16" y="191.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="1080.5" y="197" width="0.8" height="15.0" fill="rgb(245,197,33)" rx="2" ry="2" />
+<text  x="1083.47" y="207.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runGlobalGetOp (17 samples, 1.23%)</title><rect x="827.2" y="245" width="14.5" height="15.0" fill="rgb(220,90,10)" rx="2" ry="2" />
+<text  x="830.19" y="255.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (7 samples, 0.51%)</title><rect x="864.8" y="69" width="6.0" height="15.0" fill="rgb(222,128,20)" rx="2" ry="2" />
+<text  x="867.84" y="79.5" ></text>
+</g>
+<g >
+<title>unordered_map (1 samples, 0.07%)</title><rect x="50.2" y="469" width="0.9" height="15.0" fill="rgb(219,42,3)" rx="2" ry="2" />
+<text  x="53.22" y="479.5" ></text>
+</g>
+<g >
+<title>_GLOBAL__sub_I_validator.cpp (1 samples, 0.07%)</title><rect x="51.9" y="501" width="0.9" height="15.0" fill="rgb(211,40,22)" rx="2" ry="2" />
+<text  x="54.93" y="511.5" ></text>
+</g>
+<g >
+<title>sched_clock_cpu (1 samples, 0.07%)</title><rect x="57.1" y="357" width="0.8" height="15.0" fill="rgb(220,159,22)" rx="2" ry="2" />
+<text  x="60.06" y="367.5" ></text>
+</g>
+<g >
+<title>_raw_spin_lock (1 samples, 0.07%)</title><rect x="53.6" y="405" width="0.9" height="15.0" fill="rgb(238,229,12)" rx="2" ry="2" />
+<text  x="56.64" y="415.5" ></text>
+</g>
+<g >
+<title>expected&lt;WasmEdge::Runtime::Instance::MemoryInstance *const &amp;, nullptr, true&gt; (11 samples, 0.80%)</title><rect x="686.9" y="181" width="9.4" height="15.0" fill="rgb(240,26,31)" rx="2" ry="2" />
+<text  x="689.85" y="191.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::Instance::MemoryInstance::storeValue&lt;unsigned int&gt; (16 samples, 1.16%)</title><rect x="1116.4" y="229" width="13.7" height="15.0" fill="rgb(222,177,34)" rx="2" ry="2" />
+<text  x="1119.41" y="239.5" ></text>
+</g>
+<g >
+<title>unmap_single_vma (1 samples, 0.07%)</title><rect x="1189.1" y="405" width="0.9" height="15.0" fill="rgb(235,172,40)" rx="2" ry="2" />
+<text  x="1192.14" y="415.5" ></text>
+</g>
+<g >
+<title>perf_event_mmap (1 samples, 0.07%)</title><rect x="57.1" y="453" width="0.8" height="15.0" fill="rgb(211,8,24)" rx="2" ry="2" />
+<text  x="60.06" y="463.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::Instance::FunctionInstance::getInstrs (2 samples, 0.15%)</title><rect x="780.1" y="213" width="1.7" height="15.0" fill="rgb(242,109,23)" rx="2" ry="2" />
+<text  x="783.12" y="223.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="845.2" y="117" width="0.8" height="15.0" fill="rgb(245,106,17)" rx="2" ry="2" />
+<text  x="848.16" y="127.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;std::allocator&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (11 samples, 0.80%)</title><rect x="1023.1" y="197" width="9.5" height="15.0" fill="rgb(250,65,48)" rx="2" ry="2" />
+<text  x="1026.14" y="207.5" ></text>
+</g>
+<g >
+<title>exit_mmap (2 samples, 0.15%)</title><rect x="1188.3" y="437" width="1.7" height="15.0" fill="rgb(224,61,48)" rx="2" ry="2" />
+<text  x="1191.29" y="447.5" ></text>
+</g>
+<g >
+<title>std::fill_n&lt;unsigned long*, unsigned long, unsigned long&gt; (1 samples, 0.07%)</title><rect x="60.5" y="389" width="0.8" height="15.0" fill="rgb(229,141,36)" rx="2" ry="2" />
+<text  x="63.49" y="399.5" ></text>
+</g>
+<g >
+<title>filemap_map_pages (1 samples, 0.07%)</title><rect x="56.2" y="389" width="0.9" height="15.0" fill="rgb(220,37,4)" rx="2" ry="2" />
+<text  x="59.21" y="399.5" ></text>
+</g>
+<g >
+<title>expected&lt;WasmEdge::Runtime::Instance::ModuleInstance *const &amp;, nullptr, true&gt; (2 samples, 0.15%)</title><rect x="871.7" y="165" width="1.7" height="15.0" fill="rgb(232,153,34)" rx="2" ry="2" />
+<text  x="874.68" y="175.5" ></text>
+</g>
+<g >
+<title>WasmEdge::VM::VM::runWasmFile (1,313 samples, 95.21%)</title><rect x="63.9" y="341" width="1123.5" height="15.0" fill="rgb(254,100,44)" rx="2" ry="2" />
+<text  x="66.91" y="351.5" >WasmEdge::VM::VM::runWasmFile</text>
+</g>
+<g >
+<title>variant&lt;WasmEdge::Runtime::Instance::FunctionInstance::WasmFunction, cxx20::span&lt;const std::pair&lt;unsigned int, WasmEdge::ValType&gt;, 18446744073709551615&gt; &amp;, cxx20::span&lt;const WasmEdge::AST::Instruction, 18446744073709551615&gt; &amp;, void&gt; (1 samples, 0.07%)</title><rect x="63.9" y="213" width="0.9" height="15.0" fill="rgb(239,180,16)" rx="2" ry="2" />
+<text  x="66.91" y="223.5" ></text>
+</g>
+<g >
+<title>cxx20::detail::expected_view_base&lt;void, WasmEdge::ErrCode&gt;::has_value (13 samples, 0.94%)</title><rect x="208.5" y="245" width="11.1" height="15.0" fill="rgb(219,65,44)" rx="2" ry="2" />
+<text  x="211.52" y="255.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::pop (4 samples, 0.29%)</title><rect x="1130.1" y="229" width="3.4" height="15.0" fill="rgb(211,140,26)" rx="2" ry="2" />
+<text  x="1133.10" y="239.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::Instance::ModuleInstance::getFuncAddr (5 samples, 0.36%)</title><rect x="811.8" y="229" width="4.3" height="15.0" fill="rgb(233,83,39)" rx="2" ry="2" />
+<text  x="814.78" y="239.5" ></text>
+</g>
+<g >
+<title>_Variant_storage&lt;0, cxx20::span&lt;const std::pair&lt;unsigned int, WasmEdge::ValType&gt;, 18446744073709551615&gt; &amp;, cxx20::span&lt;const WasmEdge::AST::Instruction, 18446744073709551615&gt; &amp;&gt; (1 samples, 0.07%)</title><rect x="63.9" y="101" width="0.9" height="15.0" fill="rgb(220,41,18)" rx="2" ry="2" />
+<text  x="66.91" y="111.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::Instance::FunctionInstance*, std::allocator&lt;WasmEdge::Runtime::Instance::FunctionInstance*&gt; &gt;::size (2 samples, 0.15%)</title><rect x="822.1" y="197" width="1.7" height="15.0" fill="rgb(248,165,7)" rx="2" ry="2" />
+<text  x="825.05" y="207.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="830.6" y="149" width="0.9" height="15.0" fill="rgb(224,84,21)" rx="2" ry="2" />
+<text  x="833.61" y="159.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::pop_back (1 samples, 0.07%)</title><rect x="1104.4" y="213" width="0.9" height="15.0" fill="rgb(236,178,50)" rx="2" ry="2" />
+<text  x="1107.43" y="223.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::end (4 samples, 0.29%)</title><rect x="1090.7" y="197" width="3.5" height="15.0" fill="rgb(236,145,20)" rx="2" ry="2" />
+<text  x="1093.74" y="207.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::push&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="1185.7" y="245" width="0.9" height="15.0" fill="rgb(249,80,0)" rx="2" ry="2" />
+<text  x="1188.72" y="255.5" ></text>
+</g>
+<g >
+<title>__x64_sys_exit_group (2 samples, 0.15%)</title><rect x="1188.3" y="501" width="1.7" height="15.0" fill="rgb(239,93,10)" rx="2" ry="2" />
+<text  x="1191.29" y="511.5" ></text>
+</g>
+<g >
+<title>std::__invoke&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1,316 samples, 95.43%)</title><rect x="61.3" y="389" width="1126.1" height="15.0" fill="rgb(250,220,5)" rx="2" ry="2" />
+<text  x="64.34" y="399.5" >std::__invoke&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, uns..</text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getInstance&lt;WasmEdge::Runtime::Instance::FunctionInstance&gt; (2 samples, 0.15%)</title><rect x="822.1" y="213" width="1.7" height="15.0" fill="rgb(243,151,7)" rx="2" ry="2" />
+<text  x="825.05" y="223.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (7 samples, 0.51%)</title><rect x="864.8" y="149" width="6.0" height="15.0" fill="rgb(239,165,53)" rx="2" ry="2" />
+<text  x="867.84" y="159.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Loader::Loader::loadSectionContentVec&lt;WasmEdge::AST::CodeSection, WasmEdge::Loader::Loader::loadSection (3 samples, 0.22%)</title><rect x="61.3" y="261" width="2.6" height="15.0" fill="rgb(254,95,9)" rx="2" ry="2" />
+<text  x="64.34" y="271.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (2 samples, 0.15%)</title><rect x="871.7" y="133" width="1.7" height="15.0" fill="rgb(248,82,0)" rx="2" ry="2" />
+<text  x="874.68" y="143.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runBrOp (6 samples, 0.44%)</title><rect x="713.4" y="229" width="5.1" height="15.0" fill="rgb(220,58,27)" rx="2" ry="2" />
+<text  x="716.38" y="239.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="830.6" y="101" width="0.9" height="15.0" fill="rgb(235,159,50)" rx="2" ry="2" />
+<text  x="833.61" y="111.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (2 samples, 0.15%)</title><rect x="1188.3" y="533" width="1.7" height="15.0" fill="rgb(222,117,18)" rx="2" ry="2" />
+<text  x="1191.29" y="543.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (24 samples, 1.74%)</title><rect x="1147.2" y="213" width="20.6" height="15.0" fill="rgb(205,141,48)" rx="2" ry="2" />
+<text  x="1150.22" y="223.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Label, std::allocator&lt;WasmEdge::Runtime::StackManager::Label&gt; &gt;::erase (1 samples, 0.07%)</title><rect x="1136.9" y="213" width="0.9" height="15.0" fill="rgb(226,199,26)" rx="2" ry="2" />
+<text  x="1139.95" y="223.5" ></text>
+</g>
+<g >
+<title>page_add_new_anon_rmap (1 samples, 0.07%)</title><rect x="55.4" y="389" width="0.8" height="15.0" fill="rgb(216,35,12)" rx="2" ry="2" />
+<text  x="58.35" y="399.5" ></text>
+</g>
+<g >
+<title>operator (3 samples, 0.22%)</title><rect x="61.3" y="277" width="2.6" height="15.0" fill="rgb(221,69,38)" rx="2" ry="2" />
+<text  x="64.34" y="287.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::isTopDummyFrame (15 samples, 1.09%)</title><rect x="852.0" y="213" width="12.8" height="15.0" fill="rgb(217,106,24)" rx="2" ry="2" />
+<text  x="855.00" y="223.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="649.2" y="149" width="0.9" height="15.0" fill="rgb(240,200,34)" rx="2" ry="2" />
+<text  x="652.20" y="159.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runStoreOp&lt;unsigned long&gt; (1 samples, 0.07%)</title><rect x="1134.4" y="245" width="0.8" height="15.0" fill="rgb(241,37,34)" rx="2" ry="2" />
+<text  x="1137.38" y="255.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="830.6" y="69" width="0.9" height="15.0" fill="rgb(206,187,24)" rx="2" ry="2" />
+<text  x="833.61" y="79.5" ></text>
+</g>
+<g >
+<title>_GLOBAL__sub_I_export.cpp (1 samples, 0.07%)</title><rect x="51.1" y="501" width="0.8" height="15.0" fill="rgb(227,82,42)" rx="2" ry="2" />
+<text  x="54.07" y="511.5" ></text>
+</g>
+<g >
+<title>expected_storage_base&lt;WasmEdge::Runtime::Instance::ModuleInstance *const &amp;, nullptr, true&gt; (1 samples, 0.07%)</title><rect x="701.4" y="69" width="0.9" height="15.0" fill="rgb(232,70,38)" rx="2" ry="2" />
+<text  x="704.40" y="79.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::end (23 samples, 1.67%)</title><rect x="663.7" y="197" width="19.7" height="15.0" fill="rgb(245,62,16)" rx="2" ry="2" />
+<text  x="666.75" y="207.5" ></text>
+</g>
+<g >
+<title>expected_storage_base&lt;const unsigned int &amp;, nullptr, true&gt; (1 samples, 0.07%)</title><rect x="845.2" y="69" width="0.8" height="15.0" fill="rgb(207,74,52)" rx="2" ry="2" />
+<text  x="848.16" y="79.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Loader::Loader::loadExpression (3 samples, 0.22%)</title><rect x="61.3" y="213" width="2.6" height="15.0" fill="rgb(220,94,13)" rx="2" ry="2" />
+<text  x="64.34" y="223.5" ></text>
+</g>
+<g >
+<title>std::_Hashtable&lt;WasmEdge::OpCode, std::pair&lt;WasmEdge::OpCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;WasmEdge::OpCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt;, std::__detail::_Select1st, std::equal_to&lt;WasmEdge::OpCode&gt;, std::hash&lt;WasmEdge::OpCode&gt;, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits&lt;false, false, true&gt; &gt;::_M_bucket_index (1 samples, 0.07%)</title><rect x="1187.4" y="389" width="0.9" height="15.0" fill="rgb(235,165,26)" rx="2" ry="2" />
+<text  x="1190.43" y="399.5" ></text>
+</g>
+<g >
+<title>WasmFunction (1 samples, 0.07%)</title><rect x="63.9" y="53" width="0.9" height="15.0" fill="rgb(215,208,21)" rx="2" ry="2" />
+<text  x="66.91" y="63.5" ></text>
+</g>
+<g >
+<title>do_async_page_fault (5 samples, 0.36%)</title><rect x="52.8" y="501" width="4.3" height="15.0" fill="rgb(235,3,14)" rx="2" ry="2" />
+<text  x="55.78" y="511.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="1185.7" y="229" width="0.9" height="15.0" fill="rgb(213,25,38)" rx="2" ry="2" />
+<text  x="1188.72" y="239.5" ></text>
+</g>
+<g >
+<title>unmap_vmas (1 samples, 0.07%)</title><rect x="59.6" y="421" width="0.9" height="15.0" fill="rgb(254,21,13)" rx="2" ry="2" />
+<text  x="62.63" y="431.5" ></text>
+</g>
+<g >
+<title>unordered_map (1 samples, 0.07%)</title><rect x="51.9" y="469" width="0.9" height="15.0" fill="rgb(221,212,44)" rx="2" ry="2" />
+<text  x="54.93" y="479.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (11 samples, 0.80%)</title><rect x="686.9" y="149" width="9.4" height="15.0" fill="rgb(247,75,19)" rx="2" ry="2" />
+<text  x="689.85" y="159.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="701.4" y="85" width="0.9" height="15.0" fill="rgb(230,228,46)" rx="2" ry="2" />
+<text  x="704.40" y="95.5" ></text>
+</g>
+<g >
+<title>WasmEdge::AST::Instruction::getTargetIndex (37 samples, 2.68%)</title><rect x="612.4" y="245" width="31.7" height="15.0" fill="rgb(237,190,7)" rx="2" ry="2" />
+<text  x="615.41" y="255.5" >Wa..</text>
+</g>
+<g >
+<title>std::__uninitialized_fill_n_a&lt;unsigned long*, unsigned long, unsigned long, unsigned long&gt; (1 samples, 0.07%)</title><rect x="60.5" y="437" width="0.8" height="15.0" fill="rgb(223,215,22)" rx="2" ry="2" />
+<text  x="63.49" y="447.5" ></text>
+</g>
+<g >
+<title>expected_storage_base&lt;WasmEdge::Runtime::Instance::MemoryInstance *const &amp;, nullptr, true&gt; (11 samples, 0.80%)</title><rect x="686.9" y="69" width="9.4" height="15.0" fill="rgb(227,205,52)" rx="2" ry="2" />
+<text  x="689.85" y="79.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::Instance::MemoryInstance::storeValue&lt;unsigned long&gt; (1 samples, 0.07%)</title><rect x="1134.4" y="229" width="0.8" height="15.0" fill="rgb(214,89,22)" rx="2" ry="2" />
+<text  x="1137.38" y="239.5" ></text>
+</g>
+<g >
+<title>VariadicUnion&lt;2, const unsigned __int128 &amp;&gt; (24 samples, 1.74%)</title><rect x="591.9" y="133" width="20.5" height="15.0" fill="rgb(236,50,41)" rx="2" ry="2" />
+<text  x="594.87" y="143.5" ></text>
+</g>
+<g >
+<title>VariadicUnion&lt;4, const unsigned __int128 &amp;&gt; (24 samples, 1.74%)</title><rect x="591.9" y="165" width="20.5" height="15.0" fill="rgb(236,188,0)" rx="2" ry="2" />
+<text  x="594.87" y="175.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (24 samples, 1.74%)</title><rect x="781.8" y="181" width="20.6" height="15.0" fill="rgb(232,52,45)" rx="2" ry="2" />
+<text  x="784.83" y="191.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="718.5" y="197" width="0.9" height="15.0" fill="rgb(227,202,40)" rx="2" ry="2" />
+<text  x="721.51" y="207.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::importInstance&lt;WasmEdge::Runtime::Instance::FunctionInstance, unsigned int&amp;, WasmEdge::AST::FunctionType const&amp;, cxx20::span&lt;std::pair&lt;unsigned int, WasmEdge::ValType&gt; const, 18446744073709551615ul&gt;, cxx20::span&lt;WasmEdge::AST::Instruction const, 18446744073709551615ul&gt; &gt; (1 samples, 0.07%)</title><rect x="63.9" y="261" width="0.9" height="15.0" fill="rgb(252,224,29)" rx="2" ry="2" />
+<text  x="66.91" y="271.5" ></text>
+</g>
+<g >
+<title>cxx20::detail::expected_view_base&lt;void, WasmEdge::ErrCode&gt;::has_value (1 samples, 0.07%)</title><rect x="1133.5" y="213" width="0.9" height="15.0" fill="rgb(241,134,30)" rx="2" ry="2" />
+<text  x="1136.52" y="223.5" ></text>
+</g>
+<g >
+<title>_Hashtable (1 samples, 0.07%)</title><rect x="50.2" y="453" width="0.9" height="15.0" fill="rgb(254,144,51)" rx="2" ry="2" />
+<text  x="53.22" y="463.5" ></text>
+</g>
+<g >
+<title>async_page_fault (1 samples, 0.07%)</title><rect x="60.5" y="357" width="0.8" height="15.0" fill="rgb(239,211,21)" rx="2" ry="2" />
+<text  x="63.49" y="367.5" ></text>
+</g>
+<g >
+<title>FunctionInstance (1 samples, 0.07%)</title><rect x="63.9" y="229" width="0.9" height="15.0" fill="rgb(252,187,13)" rx="2" ry="2" />
+<text  x="66.91" y="239.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::leaveLabel (5 samples, 0.36%)</title><rect x="1136.9" y="245" width="4.3" height="15.0" fill="rgb(214,148,47)" rx="2" ry="2" />
+<text  x="1139.95" y="255.5" ></text>
+</g>
+<g >
+<title>__cxx_global_var_init.22 (1 samples, 0.07%)</title><rect x="51.1" y="485" width="0.8" height="15.0" fill="rgb(215,52,26)" rx="2" ry="2" />
+<text  x="54.07" y="495.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;unsigned long, std::allocator&lt;unsigned long&gt; &gt;::_M_fill_initialize (1 samples, 0.07%)</title><rect x="60.5" y="453" width="0.8" height="15.0" fill="rgb(222,139,32)" rx="2" ry="2" />
+<text  x="63.49" y="463.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::new_allocator&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (6 samples, 0.44%)</title><rect x="836.6" y="181" width="5.1" height="15.0" fill="rgb(252,111,49)" rx="2" ry="2" />
+<text  x="839.60" y="191.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (8 samples, 0.58%)</title><rect x="834.9" y="213" width="6.8" height="15.0" fill="rgb(218,114,15)" rx="2" ry="2" />
+<text  x="837.89" y="223.5" ></text>
+</g>
+<g >
+<title>__handle_mm_fault (4 samples, 0.29%)</title><rect x="53.6" y="421" width="3.5" height="15.0" fill="rgb(227,83,28)" rx="2" ry="2" />
+<text  x="56.64" y="431.5" ></text>
+</g>
+<g >
+<title>local_clock (1 samples, 0.07%)</title><rect x="57.1" y="373" width="0.8" height="15.0" fill="rgb(229,146,50)" rx="2" ry="2" />
+<text  x="60.06" y="383.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::construct&lt;WasmEdge::Runtime::StackManager::Frame, unsigned int const&amp;, unsigned long, unsigned long, unsigned int const&amp;&gt; (1 samples, 0.07%)</title><rect x="804.9" y="181" width="0.9" height="15.0" fill="rgb(249,89,0)" rx="2" ry="2" />
+<text  x="807.94" y="191.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::branchToLabel (5 samples, 0.36%)</title><rect x="714.2" y="213" width="4.3" height="15.0" fill="rgb(222,124,37)" rx="2" ry="2" />
+<text  x="717.23" y="223.5" ></text>
+</g>
+<g >
+<title>expected&lt;WasmEdge::Runtime::Instance::ModuleInstance *const &amp;, nullptr, true&gt; (1 samples, 0.07%)</title><rect x="701.4" y="181" width="0.9" height="15.0" fill="rgb(250,145,0)" rx="2" ry="2" />
+<text  x="704.40" y="191.5" ></text>
+</g>
+<g >
+<title>std::__invoke_impl&lt;void, WasmEdge::VM::Async&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1,316 samples, 95.43%)</title><rect x="61.3" y="453" width="1126.1" height="15.0" fill="rgb(229,111,28)" rx="2" ry="2" />
+<text  x="64.34" y="463.5" >std::__invoke_impl&lt;void, WasmEdge::VM::Async&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, u..</text>
+</g>
+<g >
+<title>std::allocator_traits&lt;std::allocator&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (6 samples, 0.44%)</title><rect x="836.6" y="197" width="5.1" height="15.0" fill="rgb(220,208,20)" rx="2" ry="2" />
+<text  x="839.60" y="207.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Loader::Loader::loadSection (3 samples, 0.22%)</title><rect x="61.3" y="309" width="2.6" height="15.0" fill="rgb(242,120,41)" rx="2" ry="2" />
+<text  x="64.34" y="319.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getGlobal (1 samples, 0.07%)</title><rect x="829.8" y="213" width="0.8" height="15.0" fill="rgb(219,63,0)" rx="2" ry="2" />
+<text  x="832.75" y="223.5" ></text>
+</g>
+<g >
+<title>_Variant_storage (1 samples, 0.07%)</title><rect x="63.9" y="133" width="0.9" height="15.0" fill="rgb(209,174,26)" rx="2" ry="2" />
+<text  x="66.91" y="143.5" ></text>
+</g>
+<g >
+<title>expected&lt;WasmEdge::Runtime::Instance::MemoryInstance *const &amp;, nullptr, true&gt; (11 samples, 0.80%)</title><rect x="686.9" y="197" width="9.4" height="15.0" fill="rgb(246,123,4)" rx="2" ry="2" />
+<text  x="689.85" y="207.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::end (4 samples, 0.29%)</title><rect x="1101.0" y="197" width="3.4" height="15.0" fill="rgb(246,196,29)" rx="2" ry="2" />
+<text  x="1104.01" y="207.5" ></text>
+</g>
+<g >
+<title>_Variant_storage (1 samples, 0.07%)</title><rect x="63.9" y="117" width="0.9" height="15.0" fill="rgb(243,130,12)" rx="2" ry="2" />
+<text  x="66.91" y="127.5" ></text>
+</g>
+<g >
+<title>prepend_name (1 samples, 0.07%)</title><rect x="58.8" y="373" width="0.8" height="15.0" fill="rgb(252,20,39)" rx="2" ry="2" />
+<text  x="61.77" y="383.5" ></text>
+</g>
+<g >
+<title>unmap_page_range (1 samples, 0.07%)</title><rect x="1189.1" y="389" width="0.9" height="15.0" fill="rgb(217,175,41)" rx="2" ry="2" />
+<text  x="1192.14" y="399.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::getTop (1 samples, 0.07%)</title><rect x="1136.1" y="245" width="0.8" height="15.0" fill="rgb(239,45,21)" rx="2" ry="2" />
+<text  x="1139.09" y="255.5" ></text>
+</g>
+<g >
+<title>__normal_iterator (21 samples, 1.52%)</title><rect x="1167.8" y="197" width="17.9" height="15.0" fill="rgb(209,192,30)" rx="2" ry="2" />
+<text  x="1170.75" y="207.5" ></text>
+</g>
+<g >
+<title>std::apply&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1,316 samples, 95.43%)</title><rect x="61.3" y="421" width="1126.1" height="15.0" fill="rgb(239,191,4)" rx="2" ry="2" />
+<text  x="64.34" y="431.5" >std::apply&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsign..</text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="701.4" y="117" width="0.9" height="15.0" fill="rgb(235,184,14)" rx="2" ry="2" />
+<text  x="704.40" y="127.5" ></text>
+</g>
+<g >
+<title>file_path (1 samples, 0.07%)</title><rect x="58.8" y="421" width="0.8" height="15.0" fill="rgb(252,73,7)" rx="2" ry="2" />
+<text  x="61.77" y="431.5" ></text>
+</g>
+<g >
+<title>variant&lt;0, cxx20::span&lt;const std::pair&lt;unsigned int, WasmEdge::ValType&gt;, 18446744073709551615&gt; &amp;, cxx20::span&lt;const WasmEdge::AST::Instruction, 18446744073709551615&gt; &amp;, WasmEdge::Runtime::Instance::FunctionInstance::WasmFunction, void&gt; (1 samples, 0.07%)</title><rect x="63.9" y="197" width="0.9" height="15.0" fill="rgb(214,49,7)" rx="2" ry="2" />
+<text  x="66.91" y="207.5" ></text>
+</g>
+<g >
+<title>std::__detail::_Hash_code_base&lt;WasmEdge::OpCode, std::pair&lt;WasmEdge::OpCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::__detail::_Select1st, std::hash&lt;WasmEdge::OpCode&gt;, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, false&gt;::_M_bucket_index (1 samples, 0.07%)</title><rect x="1187.4" y="373" width="0.9" height="15.0" fill="rgb(234,192,2)" rx="2" ry="2" />
+<text  x="1190.43" y="383.5" ></text>
+</g>
+<g >
+<title>mem_cgroup_throttle_swaprate (1 samples, 0.07%)</title><rect x="54.5" y="373" width="0.9" height="15.0" fill="rgb(215,191,25)" rx="2" ry="2" />
+<text  x="57.50" y="383.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Label, std::allocator&lt;WasmEdge::Runtime::StackManager::Label&gt; &gt;::size (1 samples, 0.07%)</title><rect x="1140.4" y="229" width="0.8" height="15.0" fill="rgb(225,202,44)" rx="2" ry="2" />
+<text  x="1143.37" y="239.5" ></text>
+</g>
+<g >
+<title>mmput (2 samples, 0.15%)</title><rect x="1188.3" y="453" width="1.7" height="15.0" fill="rgb(241,56,26)" rx="2" ry="2" />
+<text  x="1191.29" y="463.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (2 samples, 0.15%)</title><rect x="871.7" y="85" width="1.7" height="15.0" fill="rgb(210,202,45)" rx="2" ry="2" />
+<text  x="874.68" y="95.5" ></text>
+</g>
+<g >
+<title>async_page_fault (1 samples, 0.07%)</title><rect x="50.2" y="405" width="0.9" height="15.0" fill="rgb(212,211,36)" rx="2" ry="2" />
+<text  x="53.22" y="415.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (2 samples, 0.15%)</title><rect x="813.5" y="165" width="1.7" height="15.0" fill="rgb(220,9,36)" rx="2" ry="2" />
+<text  x="816.50" y="175.5" ></text>
+</g>
+<g >
+<title>__x64_sys_mprotect (2 samples, 0.15%)</title><rect x="57.9" y="485" width="1.7" height="15.0" fill="rgb(225,33,39)" rx="2" ry="2" />
+<text  x="60.92" y="495.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::instantiate (1 samples, 0.07%)</title><rect x="63.9" y="293" width="0.9" height="15.0" fill="rgb(249,135,4)" rx="2" ry="2" />
+<text  x="66.91" y="303.5" ></text>
+</g>
+<g >
+<title>entry_SYSCALL_64_after_hwframe (4 samples, 0.29%)</title><rect x="57.1" y="517" width="3.4" height="15.0" fill="rgb(207,131,4)" rx="2" ry="2" />
+<text  x="60.06" y="527.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="701.4" y="101" width="0.9" height="15.0" fill="rgb(223,203,13)" rx="2" ry="2" />
+<text  x="704.40" y="111.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runLocalSetOp (60 samples, 4.35%)</title><rect x="1032.6" y="245" width="51.3" height="15.0" fill="rgb(220,187,31)" rx="2" ry="2" />
+<text  x="1035.55" y="255.5" >WasmE..</text>
+</g>
+<g >
+<title>unordered_map (1 samples, 0.07%)</title><rect x="1187.4" y="501" width="0.9" height="15.0" fill="rgb(248,63,39)" rx="2" ry="2" />
+<text  x="1190.43" y="511.5" ></text>
+</g>
+<g >
+<title>unmap_vmas (1 samples, 0.07%)</title><rect x="1189.1" y="421" width="0.9" height="15.0" fill="rgb(230,161,18)" rx="2" ry="2" />
+<text  x="1192.14" y="431.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="845.2" y="85" width="0.8" height="15.0" fill="rgb(242,98,24)" rx="2" ry="2" />
+<text  x="848.16" y="95.5" ></text>
+</g>
+<g >
+<title>std::thread::_State_impl&lt;std::thread::_Invoker&lt;std::tuple&lt;WasmEdge::VM::Async&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1,316 samples, 95.43%)</title><rect x="61.3" y="517" width="1126.1" height="15.0" fill="rgb(240,6,19)" rx="2" ry="2" />
+<text  x="64.34" y="527.5" >std::thread::_State_impl&lt;std::thread::_Invoker&lt;std::tuple&lt;WasmEdge::VM::Async&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsi..</text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="712.5" y="213" width="0.9" height="15.0" fill="rgb(247,115,5)" rx="2" ry="2" />
+<text  x="715.52" y="223.5" ></text>
+</g>
+<g >
+<title>std::_Hashtable&lt;WasmEdge::OpCode, std::pair&lt;WasmEdge::OpCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;WasmEdge::OpCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt;, std::__detail::_Select1st, std::equal_to&lt;WasmEdge::OpCode&gt;, std::hash&lt;WasmEdge::OpCode&gt;, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits&lt;false, false, true&gt; &gt;::_M_insert_unique_node (1 samples, 0.07%)</title><rect x="1187.4" y="421" width="0.9" height="15.0" fill="rgb(212,116,21)" rx="2" ry="2" />
+<text  x="1190.43" y="431.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (2 samples, 0.15%)</title><rect x="1131.8" y="213" width="1.7" height="15.0" fill="rgb(211,153,41)" rx="2" ry="2" />
+<text  x="1134.81" y="223.5" ></text>
+</g>
+<g >
+<title>expected&lt;WasmEdge::Runtime::Instance::ModuleInstance *const &amp;, nullptr, true&gt; (1 samples, 0.07%)</title><rect x="830.6" y="181" width="0.9" height="15.0" fill="rgb(240,12,18)" rx="2" ry="2" />
+<text  x="833.61" y="191.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::getBlockArity (1 samples, 0.07%)</title><rect x="708.2" y="229" width="0.9" height="15.0" fill="rgb(249,93,49)" rx="2" ry="2" />
+<text  x="711.25" y="239.5" ></text>
+</g>
+<g >
+<title>basic_string&lt;std::allocator&lt;char&gt; &gt; (1 samples, 0.07%)</title><rect x="51.1" y="453" width="0.8" height="15.0" fill="rgb(224,85,44)" rx="2" ry="2" />
+<text  x="54.07" y="463.5" ></text>
+</g>
+<g >
+<title>_Variant_base&lt;0, cxx20::span&lt;const std::pair&lt;unsigned int, WasmEdge::ValType&gt;, 18446744073709551615&gt; &amp;, cxx20::span&lt;const WasmEdge::AST::Instruction, 18446744073709551615&gt; &amp;&gt; (1 samples, 0.07%)</title><rect x="63.9" y="181" width="0.9" height="15.0" fill="rgb(224,45,34)" rx="2" ry="2" />
+<text  x="66.91" y="191.5" ></text>
+</g>
+<g >
+<title>std::__fill_n_a&lt;unsigned long*, unsigned long, unsigned long&gt; (1 samples, 0.07%)</title><rect x="60.5" y="373" width="0.8" height="15.0" fill="rgb(206,85,38)" rx="2" ry="2" />
+<text  x="63.49" y="383.5" ></text>
+</g>
+<g >
+<title>std::__invoke&lt;WasmEdge::VM::Async&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1,316 samples, 95.43%)</title><rect x="61.3" y="469" width="1126.1" height="15.0" fill="rgb(248,137,52)" rx="2" ry="2" />
+<text  x="64.34" y="479.5" >std::__invoke&lt;WasmEdge::VM::Async&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __i..</text>
+</g>
+<g >
+<title>change_pte_range (1 samples, 0.07%)</title><rect x="57.9" y="405" width="0.9" height="15.0" fill="rgb(237,102,27)" rx="2" ry="2" />
+<text  x="60.92" y="415.5" ></text>
+</g>
+<g >
+<title>mprotect_fixup (2 samples, 0.15%)</title><rect x="57.9" y="453" width="1.7" height="15.0" fill="rgb(232,72,33)" rx="2" ry="2" />
+<text  x="60.92" y="463.5" ></text>
+</g>
+<g >
+<title>__libc_csu_init (3 samples, 0.22%)</title><rect x="50.2" y="517" width="2.6" height="15.0" fill="rgb(215,59,38)" rx="2" ry="2" />
+<text  x="53.22" y="527.5" ></text>
+</g>
+<g >
+<title>Label (1 samples, 0.07%)</title><rect x="711.7" y="165" width="0.8" height="15.0" fill="rgb(245,176,9)" rx="2" ry="2" />
+<text  x="714.67" y="175.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runLoopOp (1 samples, 0.07%)</title><rect x="1085.6" y="245" width="0.9" height="15.0" fill="rgb(205,22,26)" rx="2" ry="2" />
+<text  x="1088.61" y="255.5" ></text>
+</g>
+<g >
+<title>std::_Hashtable&lt;WasmEdge::ErrCode, std::pair&lt;WasmEdge::ErrCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;WasmEdge::ErrCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt;, std::__detail::_Select1st, std::equal_to&lt;WasmEdge::ErrCode&gt;, std::hash&lt;WasmEdge::ErrCode&gt;, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits&lt;false, false, true&gt; &gt;::_M_insert&lt;std::pair&lt;WasmEdge::ErrCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; const&amp;, std::__detail::_AllocNode&lt;std::allocator&lt;std::__detail::_Hash_node&lt;std::pair&lt;WasmEdge::ErrCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, false&gt; &gt; &gt; &gt; (1 samples, 0.07%)</title><rect x="51.9" y="405" width="0.9" height="15.0" fill="rgb(252,29,35)" rx="2" ry="2" />
+<text  x="54.93" y="415.5" ></text>
+</g>
+<g >
+<title>VariadicUnion&lt;5, const unsigned __int128 &amp;&gt; (24 samples, 1.74%)</title><rect x="591.9" y="181" width="20.5" height="15.0" fill="rgb(206,39,23)" rx="2" ry="2" />
+<text  x="594.87" y="191.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::invoke (1,311 samples, 95.07%)</title><rect x="64.8" y="309" width="1121.8" height="15.0" fill="rgb(211,83,35)" rx="2" ry="2" />
+<text  x="67.76" y="319.5" >WasmEdge::Executor::Executor::invoke</text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runStoreOp&lt;unsigned int&gt; (32 samples, 2.32%)</title><rect x="1107.0" y="245" width="27.4" height="15.0" fill="rgb(225,130,46)" rx="2" ry="2" />
+<text  x="1110.00" y="255.5" >W..</text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getMemory (20 samples, 1.45%)</title><rect x="683.4" y="229" width="17.1" height="15.0" fill="rgb(230,217,8)" rx="2" ry="2" />
+<text  x="686.43" y="239.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;unsigned int, std::allocator&lt;unsigned int&gt; &gt;::size (14 samples, 1.02%)</title><rect x="650.1" y="213" width="11.9" height="15.0" fill="rgb(217,189,37)" rx="2" ry="2" />
+<text  x="653.06" y="223.5" ></text>
+</g>
+<g >
+<title>std::__detail::_Insert_base&lt;WasmEdge::OpCode, std::pair&lt;WasmEdge::OpCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;WasmEdge::OpCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt;, std::__detail::_Select1st, std::equal_to&lt;WasmEdge::OpCode&gt;, std::hash&lt;WasmEdge::OpCode&gt;, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits&lt;false, false, true&gt; &gt;::insert (1 samples, 0.07%)</title><rect x="1187.4" y="453" width="0.9" height="15.0" fill="rgb(216,197,11)" rx="2" ry="2" />
+<text  x="1190.43" y="463.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::back (26 samples, 1.89%)</title><rect x="1056.5" y="213" width="22.3" height="15.0" fill="rgb(226,215,7)" rx="2" ry="2" />
+<text  x="1059.51" y="223.5" >s..</text>
+</g>
+<g >
+<title>WasmEdge::StatisticsConfigure::isInstructionCounting (21 samples, 1.52%)</title><rect x="190.6" y="261" width="17.9" height="15.0" fill="rgb(206,160,45)" rx="2" ry="2" />
+<text  x="193.55" y="271.5" ></text>
+</g>
+<g >
+<title>__cxx_global_var_init.563 (1 samples, 0.07%)</title><rect x="50.2" y="485" width="0.9" height="15.0" fill="rgb(224,8,38)" rx="2" ry="2" />
+<text  x="53.22" y="495.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getInstance&lt;WasmEdge::Runtime::Instance::ModuleInstance&gt; (1 samples, 0.07%)</title><rect x="830.6" y="197" width="0.9" height="15.0" fill="rgb(249,205,47)" rx="2" ry="2" />
+<text  x="833.61" y="207.5" ></text>
+</g>
+<g >
+<title>expected_storage_base&lt;const unsigned int &amp;, nullptr, true&gt; (2 samples, 0.15%)</title><rect x="813.5" y="85" width="1.7" height="15.0" fill="rgb(243,89,16)" rx="2" ry="2" />
+<text  x="816.50" y="95.5" ></text>
+</g>
+<g >
+<title>do_user_addr_fault (1 samples, 0.07%)</title><rect x="50.2" y="341" width="0.9" height="15.0" fill="rgb(224,104,38)" rx="2" ry="2" />
+<text  x="53.22" y="351.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (2 samples, 0.15%)</title><rect x="813.5" y="133" width="1.7" height="15.0" fill="rgb(240,13,32)" rx="2" ry="2" />
+<text  x="816.50" y="143.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getInstance&lt;WasmEdge::Runtime::Instance::ModuleInstance&gt; (7 samples, 0.51%)</title><rect x="700.5" y="213" width="6.0" height="15.0" fill="rgb(240,220,38)" rx="2" ry="2" />
+<text  x="703.54" y="223.5" ></text>
+</g>
+<g >
+<title>unmap_single_vma (1 samples, 0.07%)</title><rect x="59.6" y="405" width="0.9" height="15.0" fill="rgb(211,82,46)" rx="2" ry="2" />
+<text  x="62.63" y="415.5" ></text>
+</g>
+<g >
+<title>unmap_region (1 samples, 0.07%)</title><rect x="59.6" y="437" width="0.9" height="15.0" fill="rgb(228,39,14)" rx="2" ry="2" />
+<text  x="62.63" y="447.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getGlobal (8 samples, 0.58%)</title><rect x="864.8" y="213" width="6.9" height="15.0" fill="rgb(245,28,1)" rx="2" ry="2" />
+<text  x="867.84" y="223.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::pushFrame (5 samples, 0.36%)</title><rect x="802.4" y="213" width="4.2" height="15.0" fill="rgb(230,36,54)" rx="2" ry="2" />
+<text  x="805.37" y="223.5" ></text>
+</g>
+<g >
+<title>d_path (1 samples, 0.07%)</title><rect x="58.8" y="405" width="0.8" height="15.0" fill="rgb(209,164,40)" rx="2" ry="2" />
+<text  x="61.77" y="415.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;unsigned int, std::allocator&lt;unsigned int&gt; &gt;::size (7 samples, 0.51%)</title><rect x="846.0" y="197" width="6.0" height="15.0" fill="rgb(232,38,33)" rx="2" ry="2" />
+<text  x="849.01" y="207.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runLoadOp&lt;unsigned int&gt; (28 samples, 2.03%)</title><rect x="874.2" y="245" width="24.0" height="15.0" fill="rgb(220,36,26)" rx="2" ry="2" />
+<text  x="877.25" y="255.5" >W..</text>
+</g>
+<g >
+<title>std::_Hashtable&lt;WasmEdge::OpCode, std::pair&lt;WasmEdge::OpCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;WasmEdge::OpCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt;, std::__detail::_Select1st, std::equal_to&lt;WasmEdge::OpCode&gt;, std::hash&lt;WasmEdge::OpCode&gt;, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits&lt;false, false, true&gt; &gt;::_M_insert_bucket_begin (1 samples, 0.07%)</title><rect x="1187.4" y="405" width="0.9" height="15.0" fill="rgb(227,189,20)" rx="2" ry="2" />
+<text  x="1190.43" y="415.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="649.2" y="101" width="0.9" height="15.0" fill="rgb(206,191,23)" rx="2" ry="2" />
+<text  x="652.20" y="111.5" ></text>
+</g>
+<g >
+<title>tlb_flush_mmu (1 samples, 0.07%)</title><rect x="1188.3" y="405" width="0.8" height="15.0" fill="rgb(210,169,13)" rx="2" ry="2" />
+<text  x="1191.29" y="415.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="1185.7" y="213" width="0.9" height="15.0" fill="rgb(222,67,7)" rx="2" ry="2" />
+<text  x="1188.72" y="223.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::popFrame (1 samples, 0.07%)</title><rect x="1136.9" y="229" width="0.9" height="15.0" fill="rgb(245,113,39)" rx="2" ry="2" />
+<text  x="1139.95" y="239.5" ></text>
+</g>
+<g >
+<title>__normal_iterator (4 samples, 0.29%)</title><rect x="1101.0" y="181" width="3.4" height="15.0" fill="rgb(229,156,0)" rx="2" ry="2" />
+<text  x="1104.01" y="191.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::Instance::ModuleInstance::getMemAddr (16 samples, 1.16%)</title><rect x="648.3" y="229" width="13.7" height="15.0" fill="rgb(234,85,11)" rx="2" ry="2" />
+<text  x="651.35" y="239.5" ></text>
+</g>
+<g >
+<title>handle_mm_fault (4 samples, 0.29%)</title><rect x="53.6" y="437" width="3.5" height="15.0" fill="rgb(215,197,44)" rx="2" ry="2" />
+<text  x="56.64" y="447.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="649.2" y="165" width="0.9" height="15.0" fill="rgb(231,38,53)" rx="2" ry="2" />
+<text  x="652.20" y="175.5" ></text>
+</g>
+<g >
+<title>expected_storage_base&lt;WasmEdge::Runtime::Instance::ModuleInstance *const &amp;, nullptr, true&gt; (1 samples, 0.07%)</title><rect x="830.6" y="53" width="0.9" height="15.0" fill="rgb(231,209,49)" rx="2" ry="2" />
+<text  x="833.61" y="63.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (2 samples, 0.15%)</title><rect x="813.5" y="101" width="1.7" height="15.0" fill="rgb(233,111,8)" rx="2" ry="2" />
+<text  x="816.50" y="111.5" ></text>
+</g>
+<g >
+<title>expected&lt;WasmEdge::Runtime::Instance::ModuleInstance *const &amp;, nullptr, true&gt; (2 samples, 0.15%)</title><rect x="871.7" y="181" width="1.7" height="15.0" fill="rgb(243,20,40)" rx="2" ry="2" />
+<text  x="874.68" y="191.5" ></text>
+</g>
+<g >
+<title>main (1 samples, 0.07%)</title><rect x="60.5" y="517" width="0.8" height="15.0" fill="rgb(222,98,12)" rx="2" ry="2" />
+<text  x="63.49" y="527.5" ></text>
+</g>
+<g >
+<title>zap_pte_range.isra.0 (1 samples, 0.07%)</title><rect x="1189.1" y="373" width="0.9" height="15.0" fill="rgb(253,206,24)" rx="2" ry="2" />
+<text  x="1192.14" y="383.5" ></text>
+</g>
+<g >
+<title>expected&lt;WasmEdge::Runtime::Instance::GlobalInstance *const &amp;, nullptr, true&gt; (7 samples, 0.51%)</title><rect x="864.8" y="165" width="6.0" height="15.0" fill="rgb(244,138,19)" rx="2" ry="2" />
+<text  x="867.84" y="175.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::getBottomN (5 samples, 0.36%)</title><rect x="1044.5" y="229" width="4.3" height="15.0" fill="rgb(206,161,31)" rx="2" ry="2" />
+<text  x="1047.53" y="239.5" ></text>
+</g>
+<g >
+<title>_Variant_storage (1 samples, 0.07%)</title><rect x="63.9" y="165" width="0.9" height="15.0" fill="rgb(221,6,22)" rx="2" ry="2" />
+<text  x="66.91" y="175.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::Instance::ModuleInstance::getGlobalAddr (1 samples, 0.07%)</title><rect x="828.9" y="213" width="0.9" height="15.0" fill="rgb(241,104,36)" rx="2" ry="2" />
+<text  x="831.90" y="223.5" ></text>
+</g>
+<g >
+<title>__do_page_fault (5 samples, 0.36%)</title><rect x="52.8" y="469" width="4.3" height="15.0" fill="rgb(206,150,17)" rx="2" ry="2" />
+<text  x="55.78" y="479.5" ></text>
+</g>
+<g >
+<title>do_anonymous_page (2 samples, 0.15%)</title><rect x="54.5" y="405" width="1.7" height="15.0" fill="rgb(225,173,42)" rx="2" ry="2" />
+<text  x="57.50" y="415.5" ></text>
+</g>
+<g >
+<title>WasmEdge::VM::VM::execute (1,311 samples, 95.07%)</title><rect x="64.8" y="325" width="1121.8" height="15.0" fill="rgb(236,213,46)" rx="2" ry="2" />
+<text  x="67.76" y="335.5" >WasmEdge::VM::VM::execute</text>
+</g>
+<g >
+<title>expected&lt;const unsigned int &amp;, nullptr, true&gt; (2 samples, 0.15%)</title><rect x="813.5" y="213" width="1.7" height="15.0" fill="rgb(220,153,23)" rx="2" ry="2" />
+<text  x="816.50" y="223.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getInstance&lt;WasmEdge::Runtime::Instance::GlobalInstance&gt; (1 samples, 0.07%)</title><rect x="829.8" y="197" width="0.8" height="15.0" fill="rgb(254,153,21)" rx="2" ry="2" />
+<text  x="832.75" y="207.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (11 samples, 0.80%)</title><rect x="686.9" y="101" width="9.4" height="15.0" fill="rgb(214,42,37)" rx="2" ry="2" />
+<text  x="689.85" y="111.5" ></text>
+</g>
+<g >
+<title>[unknown]  (1,376 samples, 99.78%)</title><rect x="10.0" y="533" width="1177.4" height="15.0" fill="rgb(245,13,37)" rx="2" ry="2" />
+<text  x="13.00" y="543.5" >[unknown] </text>
+</g>
+<g >
+<title>WasmEdge::Validator::Validator::validate (1 samples, 0.07%)</title><rect x="1186.6" y="309" width="0.8" height="15.0" fill="rgb(205,120,36)" rx="2" ry="2" />
+<text  x="1189.58" y="319.5" ></text>
+</g>
+<g >
+<title>std::_Hashtable&lt;WasmEdge::ErrCode, std::pair&lt;WasmEdge::ErrCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;WasmEdge::ErrCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt;, std::__detail::_Select1st, std::equal_to&lt;WasmEdge::ErrCode&gt;, std::hash&lt;WasmEdge::ErrCode&gt;, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits&lt;false, false, true&gt; &gt;::_M_find_node (1 samples, 0.07%)</title><rect x="51.9" y="389" width="0.9" height="15.0" fill="rgb(238,126,35)" rx="2" ry="2" />
+<text  x="54.93" y="399.5" ></text>
+</g>
+<g >
+<title>expected&lt;WasmEdge::Runtime::Instance::ModuleInstance *const &amp;, nullptr, true&gt; (1 samples, 0.07%)</title><rect x="701.4" y="197" width="0.9" height="15.0" fill="rgb(233,218,17)" rx="2" ry="2" />
+<text  x="704.40" y="207.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::__normal_iterator&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="1132.7" y="197" width="0.8" height="15.0" fill="rgb(245,45,44)" rx="2" ry="2" />
+<text  x="1135.67" y="207.5" ></text>
+</g>
+<g >
+<title>wasmedge (1,379 samples, 100.00%)</title><rect x="10.0" y="549" width="1180.0" height="15.0" fill="rgb(212,57,4)" rx="2" ry="2" />
+<text  x="13.00" y="559.5" >wasmedge</text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Label, std::allocator&lt;WasmEdge::Runtime::StackManager::Label&gt; &gt;::_M_erase (1 samples, 0.07%)</title><rect x="1136.9" y="197" width="0.9" height="15.0" fill="rgb(225,192,43)" rx="2" ry="2" />
+<text  x="1139.95" y="207.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getModule (7 samples, 0.51%)</title><rect x="700.5" y="229" width="6.0" height="15.0" fill="rgb(237,183,28)" rx="2" ry="2" />
+<text  x="703.54" y="239.5" ></text>
+</g>
+<g >
+<title>do_async_page_fault (1 samples, 0.07%)</title><rect x="60.5" y="341" width="0.8" height="15.0" fill="rgb(224,59,5)" rx="2" ry="2" />
+<text  x="63.49" y="351.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::Instance::MemoryInstance*, std::allocator&lt;WasmEdge::Runtime::Instance::MemoryInstance*&gt; &gt;::size (5 samples, 0.36%)</title><rect x="696.3" y="197" width="4.2" height="15.0" fill="rgb(251,173,46)" rx="2" ry="2" />
+<text  x="699.27" y="207.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;std::allocator&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (4 samples, 0.29%)</title><rect x="798.9" y="165" width="3.5" height="15.0" fill="rgb(249,184,38)" rx="2" ry="2" />
+<text  x="801.95" y="175.5" ></text>
+</g>
+<g >
+<title>Variant&lt;6, const unsigned __int128 &amp;&gt; (24 samples, 1.74%)</title><rect x="591.9" y="213" width="20.5" height="15.0" fill="rgb(208,10,32)" rx="2" ry="2" />
+<text  x="594.87" y="223.5" ></text>
+</g>
+<g >
+<title>__normal_iterator (4 samples, 0.29%)</title><rect x="1090.7" y="181" width="3.5" height="15.0" fill="rgb(252,68,27)" rx="2" ry="2" />
+<text  x="1093.74" y="191.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::back (6 samples, 0.44%)</title><rect x="816.9" y="213" width="5.2" height="15.0" fill="rgb(235,180,8)" rx="2" ry="2" />
+<text  x="819.92" y="223.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::new_allocator&lt;WasmEdge::AST::Instruction&gt;::construct&lt;WasmEdge::AST::Instruction, WasmEdge::OpCode&amp;, unsigned long&amp;&gt; (1 samples, 0.07%)</title><rect x="63.1" y="149" width="0.8" height="15.0" fill="rgb(225,149,1)" rx="2" ry="2" />
+<text  x="66.05" y="159.5" ></text>
+</g>
+<g >
+<title>Variant&lt;const unsigned __int128 &amp;, void&gt; (24 samples, 1.74%)</title><rect x="591.9" y="229" width="20.5" height="15.0" fill="rgb(250,189,4)" rx="2" ry="2" />
+<text  x="594.87" y="239.5" ></text>
+</g>
+<g >
+<title>WasmEdge::VM::VM::runWasmFile (1,316 samples, 95.43%)</title><rect x="61.3" y="357" width="1126.1" height="15.0" fill="rgb(252,173,3)" rx="2" ry="2" />
+<text  x="64.34" y="367.5" >WasmEdge::VM::VM::runWasmFile</text>
+</g>
+<g >
+<title>_raw_spin_lock (1 samples, 0.07%)</title><rect x="50.2" y="293" width="0.9" height="15.0" fill="rgb(206,137,5)" rx="2" ry="2" />
+<text  x="53.22" y="303.5" ></text>
+</g>
+<g >
+<title>__cxx_global_var_init.22 (1 samples, 0.07%)</title><rect x="51.9" y="485" width="0.9" height="15.0" fill="rgb(206,56,39)" rx="2" ry="2" />
+<text  x="54.93" y="495.5" ></text>
+</g>
+<g >
+<title>do_brk_flags (1 samples, 0.07%)</title><rect x="57.1" y="469" width="0.8" height="15.0" fill="rgb(231,169,22)" rx="2" ry="2" />
+<text  x="60.06" y="479.5" ></text>
+</g>
+<g >
+<title>do_group_exit (2 samples, 0.15%)</title><rect x="1188.3" y="485" width="1.7" height="15.0" fill="rgb(247,40,49)" rx="2" ry="2" />
+<text  x="1191.29" y="495.5" ></text>
+</g>
+<g >
+<title>std::make_unique&lt;WasmEdge::Runtime::Instance::FunctionInstance, unsigned int&amp;, WasmEdge::AST::FunctionType const&amp;, cxx20::span&lt;std::pair&lt;unsigned int, WasmEdge::ValType&gt; const, 18446744073709551615ul&gt;, cxx20::span&lt;WasmEdge::AST::Instruction const, 18446744073709551615ul&gt; &gt; (1 samples, 0.07%)</title><rect x="63.9" y="245" width="0.9" height="15.0" fill="rgb(240,146,16)" rx="2" ry="2" />
+<text  x="66.91" y="255.5" ></text>
+</g>
+<g >
+<title>expected_storage_base&lt;WasmEdge::Runtime::Instance::ModuleInstance *const &amp;, nullptr, true&gt; (2 samples, 0.15%)</title><rect x="871.7" y="53" width="1.7" height="15.0" fill="rgb(245,164,35)" rx="2" ry="2" />
+<text  x="874.68" y="63.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (2 samples, 0.15%)</title><rect x="871.7" y="149" width="1.7" height="15.0" fill="rgb(245,212,26)" rx="2" ry="2" />
+<text  x="874.68" y="159.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="649.2" y="117" width="0.9" height="15.0" fill="rgb(222,207,24)" rx="2" ry="2" />
+<text  x="652.20" y="127.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::Instance::ModuleInstance*, std::allocator&lt;WasmEdge::Runtime::Instance::ModuleInstance*&gt; &gt;::size (3 samples, 0.22%)</title><rect x="824.6" y="197" width="2.6" height="15.0" fill="rgb(231,51,50)" rx="2" ry="2" />
+<text  x="827.62" y="207.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StoreManager::getModule (4 samples, 0.29%)</title><rect x="823.8" y="229" width="3.4" height="15.0" fill="rgb(228,193,17)" rx="2" ry="2" />
+<text  x="826.76" y="239.5" ></text>
+</g>
+<g >
+<title>__gnu_cxx::new_allocator&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (11 samples, 0.80%)</title><rect x="1023.1" y="181" width="9.5" height="15.0" fill="rgb(219,51,4)" rx="2" ry="2" />
+<text  x="1026.14" y="191.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runLocalTeeOp (2 samples, 0.15%)</title><rect x="1083.9" y="245" width="1.7" height="15.0" fill="rgb(228,3,39)" rx="2" ry="2" />
+<text  x="1086.89" y="255.5" ></text>
+</g>
+<g >
+<title>std::__apply_impl&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1,316 samples, 95.43%)</title><rect x="61.3" y="405" width="1126.1" height="15.0" fill="rgb(241,95,0)" rx="2" ry="2" />
+<text  x="64.34" y="415.5" >std::__apply_impl&lt;cxx20::expected&lt;std::vector&lt;std::pair&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128,..</text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::push&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (24 samples, 1.74%)</title><rect x="781.8" y="213" width="20.6" height="15.0" fill="rgb(224,160,19)" rx="2" ry="2" />
+<text  x="784.83" y="223.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="1105.3" y="197" width="0.8" height="15.0" fill="rgb(228,184,47)" rx="2" ry="2" />
+<text  x="1108.29" y="207.5" ></text>
+</g>
+<g >
+<title>[unknown] (1 samples, 0.07%)</title><rect x="1187.4" y="533" width="0.9" height="15.0" fill="rgb(217,66,40)" rx="2" ry="2" />
+<text  x="1190.43" y="543.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Loader::Loader::loadInstrSeq (3 samples, 0.22%)</title><rect x="61.3" y="197" width="2.6" height="15.0" fill="rgb(234,96,19)" rx="2" ry="2" />
+<text  x="64.34" y="207.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="1105.3" y="213" width="0.8" height="15.0" fill="rgb(239,27,42)" rx="2" ry="2" />
+<text  x="1108.29" y="223.5" ></text>
+</g>
+<g >
+<title>handle_mm_fault (1 samples, 0.07%)</title><rect x="50.2" y="325" width="0.9" height="15.0" fill="rgb(230,167,33)" rx="2" ry="2" />
+<text  x="53.22" y="335.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Runtime::StackManager::Frame, std::allocator&lt;WasmEdge::Runtime::StackManager::Frame&gt; &gt;::back (4 samples, 0.29%)</title><rect x="1090.7" y="213" width="3.5" height="15.0" fill="rgb(214,61,27)" rx="2" ry="2" />
+<text  x="1093.74" y="223.5" ></text>
+</g>
+<g >
+<title>do_page_fault (1 samples, 0.07%)</title><rect x="60.5" y="325" width="0.8" height="15.0" fill="rgb(212,224,10)" rx="2" ry="2" />
+<text  x="63.49" y="335.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::pushLabel (2 samples, 0.15%)</title><rect x="806.6" y="213" width="1.8" height="15.0" fill="rgb(228,68,6)" rx="2" ry="2" />
+<text  x="809.65" y="223.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::getGlobInstByIdx (3 samples, 0.22%)</title><rect x="828.9" y="229" width="2.6" height="15.0" fill="rgb(212,199,15)" rx="2" ry="2" />
+<text  x="831.90" y="239.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runBlockOp (6 samples, 0.44%)</title><rect x="708.2" y="245" width="5.2" height="15.0" fill="rgb(237,14,53)" rx="2" ry="2" />
+<text  x="711.25" y="255.5" ></text>
+</g>
+<g >
+<title>do_syscall_64 (2 samples, 0.15%)</title><rect x="1188.3" y="517" width="1.7" height="15.0" fill="rgb(246,214,35)" rx="2" ry="2" />
+<text  x="1191.29" y="527.5" ></text>
+</g>
+<g >
+<title>perf_event_mmap (1 samples, 0.07%)</title><rect x="58.8" y="437" width="0.8" height="15.0" fill="rgb(223,138,48)" rx="2" ry="2" />
+<text  x="61.77" y="447.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::getGlobInstByIdx (37 samples, 2.68%)</title><rect x="842.6" y="229" width="31.6" height="15.0" fill="rgb(229,201,1)" rx="2" ry="2" />
+<text  x="845.59" y="239.5" >Wa..</text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="830.6" y="85" width="0.9" height="15.0" fill="rgb(218,49,53)" rx="2" ry="2" />
+<text  x="833.61" y="95.5" ></text>
+</g>
+<g >
+<title>__vm_munmap (1 samples, 0.07%)</title><rect x="59.6" y="469" width="0.9" height="15.0" fill="rgb(214,63,18)" rx="2" ry="2" />
+<text  x="62.63" y="479.5" ></text>
+</g>
+<g >
+<title>expected&lt;const unsigned int &amp;, nullptr, true&gt; (1 samples, 0.07%)</title><rect x="845.2" y="197" width="0.8" height="15.0" fill="rgb(237,113,50)" rx="2" ry="2" />
+<text  x="848.16" y="207.5" ></text>
+</g>
+<g >
+<title>std::_Hashtable&lt;WasmEdge::ErrCode, std::pair&lt;WasmEdge::ErrCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt;, std::allocator&lt;std::pair&lt;WasmEdge::ErrCode const, std::__cxx11::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt; &gt; &gt;, std::__detail::_Select1st, std::equal_to&lt;WasmEdge::ErrCode&gt;, std::hash&lt;WasmEdge::ErrCode&gt;, std::__detail::_Mod_range_hashing, std::__detail::_Default_ranged_hash, std::__detail::_Prime_rehash_policy, std::__detail::_Hashtable_traits&lt;false, false, true&gt; &gt;::_M_find_before_node (1 samples, 0.07%)</title><rect x="51.9" y="373" width="0.9" height="15.0" fill="rgb(208,123,30)" rx="2" ry="2" />
+<text  x="54.93" y="383.5" ></text>
+</g>
+<g >
+<title>__do_page_fault (1 samples, 0.07%)</title><rect x="60.5" y="309" width="0.8" height="15.0" fill="rgb(229,104,9)" rx="2" ry="2" />
+<text  x="63.49" y="319.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::branchToLabel (7 samples, 0.51%)</title><rect x="720.2" y="229" width="6.0" height="15.0" fill="rgb(246,105,18)" rx="2" ry="2" />
+<text  x="723.22" y="239.5" ></text>
+</g>
+<g >
+<title>WasmEdge::AST::Instruction::getJumpEnd (1 samples, 0.07%)</title><rect x="1085.6" y="229" width="0.9" height="15.0" fill="rgb(244,97,17)" rx="2" ry="2" />
+<text  x="1088.61" y="239.5" ></text>
+</g>
+<g >
+<title>change_protection (1 samples, 0.07%)</title><rect x="57.9" y="437" width="0.9" height="15.0" fill="rgb(212,120,32)" rx="2" ry="2" />
+<text  x="60.92" y="447.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;unsigned int, std::allocator&lt;unsigned int&gt; &gt;::size (1 samples, 0.07%)</title><rect x="828.9" y="197" width="0.9" height="15.0" fill="rgb(248,158,47)" rx="2" ry="2" />
+<text  x="831.90" y="207.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (11 samples, 0.80%)</title><rect x="686.9" y="85" width="9.4" height="15.0" fill="rgb(250,167,7)" rx="2" ry="2" />
+<text  x="689.85" y="95.5" ></text>
+</g>
+<g >
+<title>_Hashtable (1 samples, 0.07%)</title><rect x="51.9" y="453" width="0.9" height="15.0" fill="rgb(225,146,48)" rx="2" ry="2" />
+<text  x="54.93" y="463.5" ></text>
+</g>
+<g >
+<title>VariadicUnion&lt;3, const unsigned __int128 &amp;&gt; (24 samples, 1.74%)</title><rect x="591.9" y="149" width="20.5" height="15.0" fill="rgb(238,184,16)" rx="2" ry="2" />
+<text  x="594.87" y="159.5" ></text>
+</g>
+<g >
+<title>do_async_page_fault (1 samples, 0.07%)</title><rect x="50.2" y="389" width="0.9" height="15.0" fill="rgb(216,111,52)" rx="2" ry="2" />
+<text  x="53.22" y="399.5" ></text>
+</g>
+<g >
+<title>std::vector&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (1 samples, 0.07%)</title><rect x="1136.1" y="213" width="0.8" height="15.0" fill="rgb(210,84,6)" rx="2" ry="2" />
+<text  x="1139.09" y="223.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runFunction (1,311 samples, 95.07%)</title><rect x="64.8" y="293" width="1121.8" height="15.0" fill="rgb(245,206,41)" rx="2" ry="2" />
+<text  x="67.76" y="303.5" >WasmEdge::Executor::Executor::runFunction</text>
+</g>
+<g >
+<title>operator (3 samples, 0.22%)</title><rect x="61.3" y="245" width="2.6" height="15.0" fill="rgb(220,192,44)" rx="2" ry="2" />
+<text  x="64.34" y="255.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (7 samples, 0.51%)</title><rect x="864.8" y="133" width="6.0" height="15.0" fill="rgb(231,24,36)" rx="2" ry="2" />
+<text  x="867.84" y="143.5" ></text>
+</g>
+<g >
+<title>mark_page_accessed (1 samples, 0.07%)</title><rect x="59.6" y="357" width="0.9" height="15.0" fill="rgb(223,98,52)" rx="2" ry="2" />
+<text  x="62.63" y="367.5" ></text>
+</g>
+<g >
+<title>memcpy@plt (3 samples, 0.22%)</title><rect x="1127.5" y="213" width="2.6" height="15.0" fill="rgb(240,28,50)" rx="2" ry="2" />
+<text  x="1130.53" y="223.5" ></text>
+</g>
+<g >
+<title>perf_event_mmap_output (1 samples, 0.07%)</title><rect x="57.1" y="405" width="0.8" height="15.0" fill="rgb(221,219,47)" rx="2" ry="2" />
+<text  x="60.06" y="415.5" ></text>
+</g>
+<g >
+<title>std::uninitialized_fill_n&lt;unsigned long*, unsigned long, unsigned long&gt; (1 samples, 0.07%)</title><rect x="60.5" y="421" width="0.8" height="15.0" fill="rgb(231,94,41)" rx="2" ry="2" />
+<text  x="63.49" y="431.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="649.2" y="133" width="0.9" height="15.0" fill="rgb(217,224,7)" rx="2" ry="2" />
+<text  x="652.20" y="143.5" ></text>
+</g>
+<g >
+<title>free_pages_and_swap_cache (1 samples, 0.07%)</title><rect x="1188.3" y="389" width="0.8" height="15.0" fill="rgb(242,86,25)" rx="2" ry="2" />
+<text  x="1191.29" y="399.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::getOffset (1 samples, 0.07%)</title><rect x="1084.7" y="229" width="0.9" height="15.0" fill="rgb(239,171,43)" rx="2" ry="2" />
+<text  x="1087.75" y="239.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::pop (6 samples, 0.44%)</title><rect x="1078.8" y="229" width="5.1" height="15.0" fill="rgb(215,227,34)" rx="2" ry="2" />
+<text  x="1081.76" y="239.5" ></text>
+</g>
+<g >
+<title>perf_iterate_sb (1 samples, 0.07%)</title><rect x="57.1" y="437" width="0.8" height="15.0" fill="rgb(219,47,39)" rx="2" ry="2" />
+<text  x="60.06" y="447.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::push&lt;WasmEdge::Variant&lt;unsigned int, int, unsigned long, long, float, double, unsigned __int128, __int128, unsigned long __vector (8 samples, 0.58%)</title><rect x="834.9" y="229" width="6.8" height="15.0" fill="rgb(205,105,5)" rx="2" ry="2" />
+<text  x="837.89" y="239.5" ></text>
+</g>
+<g >
+<title>free_unref_page_list (1 samples, 0.07%)</title><rect x="1188.3" y="357" width="0.8" height="15.0" fill="rgb(218,159,32)" rx="2" ry="2" />
+<text  x="1191.29" y="367.5" ></text>
+</g>
+<g >
+<title>_Hashtable (1 samples, 0.07%)</title><rect x="1187.4" y="485" width="0.9" height="15.0" fill="rgb(254,175,48)" rx="2" ry="2" />
+<text  x="1190.43" y="495.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Runtime::StackManager::getModuleAddr (7 samples, 0.51%)</title><rect x="816.1" y="229" width="6.0" height="15.0" fill="rgb(243,3,20)" rx="2" ry="2" />
+<text  x="819.06" y="239.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::instantiate (1 samples, 0.07%)</title><rect x="63.9" y="309" width="0.9" height="15.0" fill="rgb(213,208,42)" rx="2" ry="2" />
+<text  x="66.91" y="319.5" ></text>
+</g>
+<g >
+<title>WasmEdge::StatisticsConfigure::isCostMeasuring (8 samples, 0.58%)</title><rect x="183.7" y="261" width="6.9" height="15.0" fill="rgb(227,190,34)" rx="2" ry="2" />
+<text  x="186.71" y="271.5" ></text>
+</g>
+<g >
+<title>__do_page_fault (1 samples, 0.07%)</title><rect x="50.2" y="357" width="0.9" height="15.0" fill="rgb(249,201,29)" rx="2" ry="2" />
+<text  x="53.22" y="367.5" ></text>
+</g>
+<g >
+<title>WasmEdge::Executor::Executor::runBrIfOp (7 samples, 0.51%)</title><rect x="713.4" y="245" width="6.0" height="15.0" fill="rgb(213,29,4)" rx="2" ry="2" />
+<text  x="716.38" y="255.5" ></text>
+</g>
+<g >
+<title>expected_storage_base (1 samples, 0.07%)</title><rect x="830.6" y="133" width="0.9" height="15.0" fill="rgb(241,42,54)" rx="2" ry="2" />
+<text  x="833.61" y="143.5" ></text>
+</g>
+<g >
+<title>WasmEdge::AST::Instruction::getTargetIndex (1 samples, 0.07%)</title><rect x="719.4" y="229" width="0.8" height="15.0" fill="rgb(240,140,48)" rx="2" ry="2" />
+<text  x="722.37" y="239.5" ></text>
+</g>
+<g >
+<title>std::allocator_traits&lt;std::allocator&lt;WasmEdge::AST::Instruction&gt; &gt;::construct&lt;WasmEdge::AST::Instruction, WasmEdge::OpCode&amp;, unsigned long&amp;&gt; (1 samples, 0.07%)</title><rect x="63.1" y="165" width="0.8" height="15.0" fill="rgb(221,156,11)" rx="2" ry="2" />
+<text  x="66.05" y="175.5" ></text>
+</g>
+</g>
+</svg>
